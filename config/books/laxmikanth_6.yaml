@@ -1,0 +1,20 @@
+book:
+  id: laxmikanth_6
+  title: Indian Polity
+  author: M. Laxmikanth
+  edition: 6
+  pdf_path: data/M laxmikanth 6th edition.pdf
+
+parsing:
+  # 1-based PDF page indices (PyMuPDF). Calibrated 2025-06-03.
+  toc_start_page: 19   # "Contents" heading; PART/chapter/section tree
+  toc_end_page: 40     # last TOC page (appendix refs); p.41+ is List of Tables
+  content_start_page: 48  # Ch. 1 body ("Historical Background"); p.47 is PART-I divider
+  content_end_page: 1307  # last body page; p.1308 is APPENDICES listing
+
+  # Manual sanity check (not wired into ingest yet)
+  sanity_chapter_7_start_page: 179  # "7 Fundamental Rights" body start
+
+structure:
+  part_pattern: '^PART[- ]([IVXLC]+)'
+  chapter_pattern: '^(\\d+)\\s+(.+)$'

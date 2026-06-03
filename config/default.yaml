@@ -1,0 +1,20 @@
+project:
+  name: upsc-rag
+  processed_dir: data/processed
+
+parsing:
+  # Skip front matter before main content (pages are 1-based)
+  content_start_page: null  # set per book in books/*.yaml
+
+chunking:
+  child_chunk_tokens: 600
+  child_chunk_overlap: 80
+  min_chunk_chars: 200
+
+indexing:
+  collection_name: upsc_polity
+  # vector_store: chroma | qdrant | pgvector  (future)
+
+retrieval:
+  top_k: 30
+  rerank_top_k: 8

@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+*.py[cod]
+.env
+.env.*
+!.env.example
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+chroma/
+qdrant_storage/
+data/processed/
+
+# Large source PDFs — keep locally; adjust if you version them in git
+# data/*.pdf
