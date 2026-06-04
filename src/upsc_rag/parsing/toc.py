@@ -1,3 +1,8 @@
+"""
+Parses Tables of Contents (TOC).
+Contains logic for extracting and structuring the hierarchical
+table of contents from documents, aiding in navigation and chunking.
+"""
 from __future__ import annotations
 
 import re

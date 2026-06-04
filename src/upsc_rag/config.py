@@ -1,3 +1,8 @@
+"""
+Configuration management for the UPSC RAG application.
+Handles loading and accessing configuration parameters from
+environment variables and configuration files.
+"""
 from __future__ import annotations
 
 from functools import lru_cache

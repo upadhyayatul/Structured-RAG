@@ -1,3 +1,8 @@
+"""
+Manages the indexing and storage of document chunks.
+Includes vector store integrations and keyword-based
+index handling for efficient retrieval operations.
+"""
 from __future__ import annotations
 
 import json

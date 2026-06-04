@@ -1,3 +1,8 @@
+"""
+Handles PDF document parsing.
+Provides utilities to extract raw text, tables, and other elements
+from PDF files for further processing in the RAG pipeline.
+"""
 from __future__ import annotations
 
 from pathlib import Path

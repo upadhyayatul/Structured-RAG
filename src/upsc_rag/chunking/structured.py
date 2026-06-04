@@ -1,3 +1,8 @@
+"""
+Implements structured chunking for documents.
+This module provides classes and functions to break down structured documents
+into manageable chunks suitable for indexing and retrieval.
+"""
 from __future__ import annotations
 
 import hashlib

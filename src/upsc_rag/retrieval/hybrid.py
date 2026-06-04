@@ -1,3 +1,8 @@
+"""
+Implements hybrid retrieval strategies.
+Combines different retrieval methods, such as dense vector search
+and sparse keyword search, to improve retrieval accuracy and recall.
+"""
 from __future__ import annotations
 
 import json

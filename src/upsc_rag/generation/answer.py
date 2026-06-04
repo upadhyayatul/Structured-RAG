@@ -1,3 +1,8 @@
+"""
+Handles answer generation using Large Language Models (LLMs).
+Provides functionalities to synthesize answers from retrieved
+context documents to satisfy user queries.
+"""
 from __future__ import annotations
 
 from typing import Any

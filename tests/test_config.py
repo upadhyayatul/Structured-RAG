@@ -1,3 +1,8 @@
+"""
+Unit tests for the configuration module.
+Verifies that configuration paths, book configs, and runtime
+configurations are loaded and parsed correctly.
+"""
 from upsc_rag.config import PROJECT_ROOT, load_book_config, load_runtime_config
 
 

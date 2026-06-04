@@ -1,3 +1,8 @@
+"""
+Defines the data ingestion pipeline.
+Coordinates the end-to-end process of loading documents, parsing,
+chunking, enriching with metadata, and indexing them into the store.
+"""
 from __future__ import annotations
 
 import argparse

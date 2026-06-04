@@ -1,3 +1,8 @@
+"""
+Pytest configuration file.
+Sets up the necessary Python path for importing the main package
+during test execution and provides shared test fixtures.
+"""
 import sys
 from pathlib import Path
 

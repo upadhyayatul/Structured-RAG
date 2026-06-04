@@ -1,3 +1,8 @@
+"""
+Aligns parsed document structures.
+Responsible for mapping and aligning different structural elements,
+such as matching table of contents entries with physical pages.
+"""
 from __future__ import annotations
 
 import re

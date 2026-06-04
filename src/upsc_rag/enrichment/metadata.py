@@ -1,3 +1,8 @@
+"""
+Provides metadata enrichment for extracted text chunks.
+Contains logic to add or infer additional metadata fields
+to improve the quality of search and retrieval.
+"""
 from __future__ import annotations
 
 from typing import Any
