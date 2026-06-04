@@ -47,6 +47,21 @@ def chunk_section_text(
 ) -> Iterator[ChunkRecord]:
     """Split section text into overlapping chunks without crossing paragraph boundaries."""
     meta = metadata or {}
+    meta_filtered = {k: v for k, v in meta.items() if k in ChunkRecord.__dataclass_fields__}
+    
+    parent_id = section_id
+    parent_meta = dict(meta_filtered)
+    parent_meta["content_type"] = "parent"
+    parent_meta["parent_id"] = None
+    
+    yield ChunkRecord(
+        id=parent_id,
+        text=text,
+        book_id=book_id,
+        entities=extract_entities(text),
+        **parent_meta,
+    )
+
     paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
     if not paragraphs:
         return
@@ -54,6 +69,10 @@ def chunk_section_text(
     buffer: list[str] = []
     buffer_tokens = 0
     chunk_index = 0
+    
+    child_meta = dict(meta_filtered)
+    child_meta["content_type"] = "child"
+    child_meta["parent_id"] = parent_id
 
     def flush() -> ChunkRecord | None:
         nonlocal chunk_index, buffer, buffer_tokens
@@ -67,7 +86,7 @@ def chunk_section_text(
             text=body,
             book_id=book_id,
             entities=extract_entities(body),
-            **{k: v for k, v in meta.items() if k in ChunkRecord.__dataclass_fields__},
+            **child_meta,
         )
         chunk_index += 1
         return record

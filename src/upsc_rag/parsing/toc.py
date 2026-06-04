@@ -51,12 +51,33 @@ def parse_table_of_contents(
         roots: list[TocNode] = []
         stack: list[TocNode] = []
 
+        pending_chapter_num = None
+        found_part = False
+        
         for raw in lines:
             line = raw.strip()
             if not line or line.lower() == "contents":
                 continue
+                
+            if line.isdigit():
+                pending_chapter_num = line
+                continue
+
             level = _heading_level(line)
+            
+            if pending_chapter_num is not None and level == 3:
+                line = f"{pending_chapter_num} {line}"
+                level = 2
+                
+            pending_chapter_num = None
+            
             if level is None:
+                continue
+
+            if level == 1:
+                found_part = True
+                
+            if not found_part:
                 continue
 
             node = TocNode(title=line, level=level)
