@@ -4,6 +4,7 @@ Coordinates the end-to-end process of loading documents, parsing,
 chunking, enriching with metadata, and indexing them into the store.
 """
 from __future__ import annotations
+from upsc_rag.parsing.toc import TocNode
 
 import argparse
 from pathlib import Path
@@ -15,7 +16,7 @@ import json
 
 from upsc_rag.parsing.pdf import open_pdf
 from upsc_rag.parsing.toc import parse_table_of_contents
-from upsc_rag.parsing.align import align_toc_with_body, extract_sections
+from upsc_rag.parsing.align import align_toc_with_body, extract_sections, fill_page_end
 from upsc_rag.chunking.structured import chunk_section_text
 
 
@@ -54,19 +55,38 @@ def run_ingest(book_id: str, output_dir: Path | None = None) -> Path:
     toc_end_page = runtime.get("parsing", {}).get("toc_end_page")
     
     if toc_start_page is not None and toc_end_page is not None:
-        toc_nodes = parse_table_of_contents(pdf_path, toc_start_page, toc_end_page)
-        
         content_start_page = runtime.get("parsing", {}).get("content_start_page")
         content_end_page = runtime.get("parsing", {}).get("content_end_page")
         
         all_chunks = []
         if content_start_page and content_end_page:
+            toc_path = out / "toc.json"
+            if toc_path.exists():
+                print(f"Loading existing TOC from {toc_path} (skipping TOC parsing)")
+                toc_data = json.loads(toc_path.read_text(encoding="utf-8"))
+                def dict_to_toc_nodes(data_list) -> list[TocNode]:
+                    nodes = []
+                    for d in data_list:
+                        children = dict_to_toc_nodes(d.get("children", []))
+                        nodes.append(TocNode(
+                            title=d["title"],
+                            level=d["level"],
+                            children=children,
+                            page_start=d.get("page_start"),
+                        page_end=d.get("page_end")
+                        ))
+                    return nodes
+                toc_nodes = dict_to_toc_nodes(toc_data)
+            else:
+                print("Parsing TOC from PDF pages...")
+                toc_nodes = parse_table_of_contents(pdf_path, toc_start_page, toc_end_page)
+            
             align_doc = open_pdf(pdf_path)
             try:
                 align_toc_with_body(align_doc, toc_nodes, content_start_page, content_end_page)
+                fill_page_end(toc_nodes, content_end_page)
                 
                 toc_dict = [dataclasses.asdict(node) for node in toc_nodes]
-                toc_path = out / "toc.json"
                 toc_path.write_text(json.dumps(toc_dict, indent=2), encoding="utf-8")
                 
                 sections = list(extract_sections(align_doc, toc_nodes, content_end_page))
