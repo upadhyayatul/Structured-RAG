@@ -19,3 +19,4 @@ data/*.pdf
 
 # Local Claude Code working docs — kept local, not shared
 progress.json
+CLAUDE.md
