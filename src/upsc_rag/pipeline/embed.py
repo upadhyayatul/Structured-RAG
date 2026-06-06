@@ -5,6 +5,9 @@ import argparse
 import json
 from pathlib import Path
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from qdrant_client import QdrantClient
 
 from upsc_rag.config import get_settings, load_runtime_config
@@ -30,7 +33,7 @@ def run_embed(book_id: str, chunks_path: Path | None = None) -> None:
     if not resolved_chunks.exists():
         raise FileNotFoundError(f"chunks.jsonl not found at {resolved_chunks}. Run ingest first.")
 
-    print(f"Loading chunks from {resolved_chunks}…")
+    print(f"Loading chunks from {resolved_chunks}...")
     all_chunks: list[dict] = []
     with resolved_chunks.open(encoding="utf-8") as f:
         for line in f:
@@ -43,9 +46,9 @@ def run_embed(book_id: str, chunks_path: Path | None = None) -> None:
     }
     child_chunks = [c for c in all_chunks if c.get("content_type") == "child"]
 
-    print(f"  {len(all_chunks)} total chunks → {len(parent_map)} parents, {len(child_chunks)} children to embed")
+    print(f"  {len(all_chunks)} total chunks -> {len(parent_map)} parents, {len(child_chunks)} children to embed")
 
-    print(f"Embedding {len(child_chunks)} child chunks with {embedding_model} (batch={batch_size})…")
+    print(f"Embedding {len(child_chunks)} child chunks with {embedding_model} (batch={batch_size})...")
     texts = [c["text"] for c in child_chunks]
     vectors = embed_texts(texts, model=embedding_model, batch_size=batch_size)
     print(f"  Done — {len(vectors)} vectors produced")
