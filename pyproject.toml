@@ -14,6 +14,8 @@ dependencies = [
     "python-dotenv>=1.0",
     "PyYAML>=6.0",
     "pymupdf>=1.24",
+    "openai>=1.30",
+    "qdrant-client>=1.9",
 ]
 
 [project.optional-dependencies]
@@ -24,6 +26,7 @@ dev = [
 
 [project.scripts]
 upsc-rag-ingest = "upsc_rag.pipeline.ingest:main"
+upsc-rag-embed = "upsc_rag.pipeline.embed:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

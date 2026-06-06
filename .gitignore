@@ -16,3 +16,6 @@ data/processed/
 
 # Large source PDFs — keep locally; adjust if you version them in git
 data/*.pdf
+
+# Local Claude Code working docs — kept local, not shared
+progress.json

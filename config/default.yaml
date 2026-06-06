@@ -13,7 +13,10 @@ chunking:
 
 indexing:
   collection_name: upsc_polity
-  # vector_store: chroma | qdrant | pgvector  (future)
+  qdrant_url: http://localhost:6333
+  embedding_model: text-embedding-3-large
+  embedding_dim: 3072
+  embed_batch_size: 100
 
 retrieval:
   top_k: 30
