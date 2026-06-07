@@ -16,6 +16,7 @@ from upsc_rag.indexing.qdrant_store import ensure_collection, upsert_points
 
 
 def run_embed(book_id: str, chunks_path: Path | None = None) -> None:
+    """Embed child chunks from chunks.jsonl and upsert them into the Qdrant collection."""
     settings = get_settings()
     runtime = load_runtime_config(book_id)
     idx_cfg = runtime.get("indexing", {})
@@ -68,6 +69,7 @@ def run_embed(book_id: str, chunks_path: Path | None = None) -> None:
 
 
 def main() -> None:
+    """CLI entry point: parse --book / --chunks args and run run_embed."""
     parser = argparse.ArgumentParser(description="Embed chunks and upsert into Qdrant")
     parser.add_argument("--book", default="laxmikanth_6", help="Book id from config/books/")
     parser.add_argument("--chunks", type=Path, default=None, help="Override path to chunks.jsonl")

@@ -1,15 +1,17 @@
-"""
-Handles answer generation using Large Language Models (LLMs).
-Provides functionalities to synthesize answers from retrieved
-context documents to satisfy user queries.
-"""
+"""Prompt builder for grounded, source-cited answers from retrieved chunks."""
 from __future__ import annotations
 
 from typing import Any
 
 
 def build_answer_prompt(query: str, contexts: list[dict[str, Any]]) -> str:
-    """Format retrieved chunks into a grounded-answer prompt."""
+    """
+    Format retrieved chunks into a numbered-source prompt ready for an LLM call.
+
+    Each context dict must contain 'text'; 'section_path', 'chapter_title', and
+    'page_start' are used for the citation line. Pass the output directly as the
+    user turn to Claude or OpenAI chat completions.
+    """
     blocks = []
     for i, ctx in enumerate(contexts, start=1):
         title = " > ".join(ctx.get("section_path") or []) or ctx.get("chapter_title", "Unknown")

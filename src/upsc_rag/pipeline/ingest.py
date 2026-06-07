@@ -1,8 +1,4 @@
-"""
-Defines the data ingestion pipeline.
-Coordinates the end-to-end process of loading documents, parsing,
-chunking, enriching with metadata, and indexing them into the store.
-"""
+"""End-to-end ingest orchestration: PDF → TOC → aligned sections → chunks.jsonl."""
 from __future__ import annotations
 from upsc_rag.parsing.toc import TocNode
 
@@ -116,6 +112,7 @@ def run_ingest(book_id: str, output_dir: Path | None = None) -> Path:
 
 
 def main() -> None:
+    """CLI entry point: parse --book / --output args and run run_ingest."""
     parser = argparse.ArgumentParser(description="Ingest a UPSC textbook into structured chunks")
     parser.add_argument("--book", default="laxmikanth_6", help="Book id from config/books/")
     parser.add_argument("--output", type=Path, default=None, help="Override processed output dir")

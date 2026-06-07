@@ -6,5 +6,6 @@ PyYAML>=6.0
 pymupdf>=1.24
 openai>=1.30
 qdrant-client>=1.9
+rank-bm25>=0.2
 
 # Dev (optional): pip install -r requirements-dev.txt

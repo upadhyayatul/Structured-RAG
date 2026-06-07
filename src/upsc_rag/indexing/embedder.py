@@ -1,4 +1,4 @@
-"""OpenAI embedding client with batched requests and retry logic."""
+"""Batched OpenAI embedding calls with exponential-backoff retry (up to 3 attempts)."""
 from __future__ import annotations
 
 import os
@@ -14,7 +14,11 @@ def embed_texts(
     model: str = "text-embedding-3-small",
     batch_size: int = 100,
 ) -> list[list[float]]:
-    """Embed a list of texts using the OpenAI API, returning vectors in the same order."""
+    """
+    Embed texts in batches via the OpenAI API; return float vectors in input order.
+
+    Retries each batch up to 3 times with exponential backoff on transient errors.
+    """
     client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
     vectors: list[list[float]] = []
 

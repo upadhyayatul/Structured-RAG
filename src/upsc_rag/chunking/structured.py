@@ -1,8 +1,4 @@
-"""
-Implements structured chunking for documents.
-This module provides classes and functions to break down structured documents
-into manageable chunks suitable for indexing and retrieval.
-"""
+"""Split section text into a parent ChunkRecord plus overlapping child ChunkRecords for indexing."""
 from __future__ import annotations
 
 import hashlib
@@ -13,6 +9,13 @@ from typing import Any, Iterator
 
 @dataclass
 class ChunkRecord:
+    """
+    One indexable text unit.
+
+    ``content_type="parent"`` stores the full section text (not embedded).
+    ``content_type="child"`` stores an overlapping ~600-token split (embedded into Qdrant).
+    """
+
     id: str
     text: str
     book_id: str
@@ -27,6 +30,7 @@ class ChunkRecord:
     entities: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
+        """Serialize to a plain dict for JSONL writing."""
         return asdict(self)
 
 
@@ -34,10 +38,12 @@ _ARTICLE_RE = re.compile(r"\bArticle\s+\d+[A-Z]?\b", re.I)
 
 
 def extract_entities(text: str) -> list[str]:
+    """Return a sorted, deduplicated list of 'Article NNN' references found in text."""
     return sorted({m.group(0) for m in _ARTICLE_RE.finditer(text)})
 
 
 def _token_estimate(text: str) -> int:
+    """Cheap token estimate: len / 4, avoiding a full tokenizer dependency."""
     return max(1, len(text) // 4)
 
 
@@ -50,7 +56,13 @@ def chunk_section_text(
     overlap_tokens: int = 80,
     metadata: dict[str, Any] | None = None,
 ) -> Iterator[ChunkRecord]:
-    """Split section text into overlapping chunks without crossing paragraph boundaries."""
+    """
+    Yield one parent chunk (full section) followed by overlapping child chunks.
+
+    Splits at paragraph boundaries so no paragraph is ever cut mid-sentence.
+    The parent is not embedded; children are embedded and point back to the parent
+    via parent_id for context expansion at retrieval time.
+    """
     meta = metadata or {}
     meta_filtered = {k: v for k, v in meta.items() if k in ChunkRecord.__dataclass_fields__}
     

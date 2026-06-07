@@ -14,12 +14,14 @@ from upsc_rag.parsing.toc import parse_table_of_contents  # noqa: E402
 
 
 def _preview(text: str, max_lines: int = 18) -> None:
+    """Print up to max_lines stripped lines of text, each truncated to 100 chars."""
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     for line in lines[:max_lines]:
         print(f"  {line[:100]}")
 
 
 def main() -> None:
+    """Print sampled page text and TOC parse summary to validate config page ranges."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--book", default="laxmikanth_6")
     args = parser.parse_args()

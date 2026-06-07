@@ -1,8 +1,4 @@
-"""
-Manages the indexing and storage of document chunks.
-Includes vector store integrations and keyword-based
-index handling for efficient retrieval operations.
-"""
+"""Write chunk dicts to a newline-delimited JSON file — the durable artifact between pipeline stages."""
 from __future__ import annotations
 
 import json
@@ -11,6 +7,7 @@ from typing import Any, Iterable
 
 
 def save_chunks_jsonl(chunks: Iterable[dict[str, Any]], path: Path) -> int:
+    """Write each chunk as a JSON line to path (creates parent dirs). Returns chunk count."""
     path.parent.mkdir(parents=True, exist_ok=True)
     count = 0
     with path.open("w", encoding="utf-8") as f:

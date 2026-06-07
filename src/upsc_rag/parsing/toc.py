@@ -1,8 +1,4 @@
-"""
-Parses Tables of Contents (TOC).
-Contains logic for extracting and structuring the hierarchical
-table of contents from documents, aiding in navigation and chunking.
-"""
+"""Parse the printed Contents pages into a TocNode tree (PART → Chapter → Section)."""
 from __future__ import annotations
 
 import re
@@ -14,6 +10,8 @@ from upsc_rag.parsing.pdf import extract_page_text, open_pdf
 
 @dataclass
 class TocNode:
+    """One node in the TOC tree; page_start/page_end are filled later by align.py."""
+
     title: str
     level: int
     children: list[TocNode] = field(default_factory=list)
@@ -32,6 +30,7 @@ _HANGING_ENDINGS = frozenset({
 
 
 def _heading_level(line: str) -> int | None:
+    """Classify a stripped TOC line as PART (1), chapter (2), or section (3); None otherwise."""
     stripped = line.strip()
     if not stripped:
         return None

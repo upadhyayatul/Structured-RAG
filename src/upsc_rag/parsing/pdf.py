@@ -1,8 +1,4 @@
-"""
-Handles PDF document parsing.
-Provides utilities to extract raw text, tables, and other elements
-from PDF files for further processing in the RAG pipeline.
-"""
+"""PyMuPDF wrapper for raw text extraction from the book PDF."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -12,6 +8,7 @@ import fitz
 
 
 def open_pdf(path: Path) -> fitz.Document:
+    """Open a PDF and return the fitz.Document; raises FileNotFoundError if missing."""
     if not path.exists():
         raise FileNotFoundError(path)
     return fitz.open(path)
@@ -28,6 +25,7 @@ def iter_pages(
     start: int = 1,
     end: int | None = None,
 ) -> Iterator[tuple[int, str]]:
+    """Yield (page_num, text) for each page in [start, end] inclusive."""
     last = end or doc.page_count
     for num in range(start, last + 1):
         yield num, extract_page_text(doc, num)

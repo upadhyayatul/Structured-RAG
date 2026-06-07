@@ -1,8 +1,4 @@
-"""
-Aligns parsed document structures.
-Responsible for mapping and aligning different structural elements,
-such as matching table of contents entries with physical pages.
-"""
+"""Align TOC nodes to body pages by fuzzy heading search, then extract per-section text."""
 from __future__ import annotations
 
 import re
@@ -15,6 +11,7 @@ from upsc_rag.parsing.pdf import iter_pages
 
 
 def _normalize(text: str) -> str:
+    """Collapse whitespace and lowercase for fuzzy heading comparison."""
     return re.sub(r'\s+', ' ', text).strip().lower()
 
 

@@ -1,4 +1,4 @@
-"""Qdrant vector store: create collection and upsert chunk points."""
+"""Qdrant collection management: create the vector index and upsert child-chunk points."""
 from __future__ import annotations
 
 import uuid
@@ -37,7 +37,12 @@ def upsert_points(
     parent_map: dict[str, str],
     batch_size: int = 256,
 ) -> int:
-    """Upsert chunk+vector pairs into Qdrant. Returns total points upserted."""
+    """
+    Upsert (chunk, vector) pairs into Qdrant in batches; return total points written.
+
+    parent_map[parent_id] = parent_text is stored in the payload so retrieval can
+    expand a child hit to its full section context without a second lookup.
+    """
     total = 0
     points: list[models.PointStruct] = []
 
