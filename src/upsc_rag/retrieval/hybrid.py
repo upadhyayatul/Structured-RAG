@@ -50,6 +50,11 @@ class HybridRetriever:
         self._default_top_k: int = retrieval_cfg.get("top_k", 30)
         self._default_rerank_top_k: int = retrieval_cfg.get("rerank_top_k", 8)
 
+        rewrite_cfg = retrieval_cfg.get("rewrite", {})
+        self._rewrite_enabled: bool = bool(rewrite_cfg.get("enabled", False))
+        self._rewrite_num_variants: int = rewrite_cfg.get("num_variants", 3)
+        self._rewrite_model: str = rewrite_cfg.get("model", "gpt-4o-mini")
+
         self._qdrant = QdrantClient(url=indexing_cfg["qdrant_url"])
         self._openai = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
@@ -77,20 +82,41 @@ class HybridRetriever:
         top_k: int | None = None,
         rerank_top_k: int | None = None,
     ) -> list[dict[str, Any]]:
-        """Return rerank_top_k results ranked by RRF, with parent text for generation."""
+        """Return rerank_top_k results ranked by RRF, with parent text for generation.
+
+        When query rewriting is enabled, retrieves for each query variant and fuses
+        all dense+BM25 rank lists together (multi-query RRF) to improve recall.
+        """
         top_k = top_k if top_k is not None else self._default_top_k
         rerank_top_k = rerank_top_k if rerank_top_k is not None else self._default_rerank_top_k
 
-        dense_ranks, qdrant_payloads = self._dense_search(query, top_k)
-        bm25_ranks = self._bm25_search(query, top_k)
+        queries = self._expand_queries(query)
 
-        fused = self._rrf_fuse(dense_ranks, bm25_ranks)
+        rank_lists: list[dict[str, int]] = []
+        qdrant_payloads: dict[str, dict] = {}
+        for q in queries:
+            dense_ranks, payloads = self._dense_search(q, top_k)
+            rank_lists.append(dense_ranks)
+            rank_lists.append(self._bm25_search(q, top_k))
+            qdrant_payloads.update(payloads)
+
+        fused = self._rrf_fuse(rank_lists)
         top_ids = sorted(fused, key=lambda cid: fused[cid], reverse=True)[:rerank_top_k]
 
         return [
             self._build_result(cid, fused[cid], qdrant_payloads)
             for cid in top_ids
         ]
+
+    def _expand_queries(self, query: str) -> list[str]:
+        """Return [query] or, if rewriting is enabled, the original plus LLM variants."""
+        if not self._rewrite_enabled:
+            return [query]
+        from upsc_rag.retrieval.rewrite import rewrite_query
+
+        return rewrite_query(
+            query, self._openai, model=self._rewrite_model, num_variants=self._rewrite_num_variants
+        )
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -117,18 +143,12 @@ class HybridRetriever:
         return {self._chunks[i]["id"]: rank for rank, i in enumerate(top_indices)}
 
     @staticmethod
-    def _rrf_fuse(
-        dense_ranks: dict[str, int], bm25_ranks: dict[str, int]
-    ) -> dict[str, float]:
-        all_ids = set(dense_ranks) | set(bm25_ranks)
+    def _rrf_fuse(rank_lists: list[dict[str, int]]) -> dict[str, float]:
+        """Reciprocal Rank Fusion across any number of rank lists (dense, BM25, per-variant)."""
         fused: dict[str, float] = {}
-        for cid in all_ids:
-            score = 0.0
-            if cid in dense_ranks:
-                score += _rrf_score(dense_ranks[cid])
-            if cid in bm25_ranks:
-                score += _rrf_score(bm25_ranks[cid])
-            fused[cid] = score
+        for ranks in rank_lists:
+            for cid, rank in ranks.items():
+                fused[cid] = fused.get(cid, 0.0) + _rrf_score(rank)
         return fused
 
     def _build_result(

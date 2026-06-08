@@ -31,6 +31,7 @@ def build_answer_prompt(query: str, contexts: list[dict[str, Any]]) -> str:
     context_block = "\n\n".join(blocks)
     return (
         "Answer using only the sources below. Cite source numbers. "
+        "Try to add Articles from the constitution related to the question is possible"
         "If the answer is not in the sources, say so.\n\n"
         f"Question: {query}\n\n"
         f"Sources:\n{context_block}\n\n"

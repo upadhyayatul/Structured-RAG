@@ -21,8 +21,13 @@ indexing:
 retrieval:
   top_k: 30
   rerank_top_k: 8
+  rewrite:
+    enabled: true          # LLM query rewriting: expand synonyms/abbreviations, multi-query retrieval
+    num_variants: 3        # number of rephrasings to add alongside the original query
+    model: gpt-4.1-nano
 
 generation:
   model: gpt-4o-mini
   temperature: 0.2
   max_tokens: 1024
+
