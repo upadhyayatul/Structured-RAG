@@ -21,3 +21,8 @@ indexing:
 retrieval:
   top_k: 30
   rerank_top_k: 8
+
+generation:
+  model: gpt-4o-mini
+  temperature: 0.2
+  max_tokens: 1024
