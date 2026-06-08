@@ -7,6 +7,7 @@ pymupdf>=1.24
 openai>=1.30
 qdrant-client>=1.9
 rank-bm25>=0.2
+snowballstemmer>=2.2
 fastapi>=0.110
 uvicorn[standard]>=0.29
 

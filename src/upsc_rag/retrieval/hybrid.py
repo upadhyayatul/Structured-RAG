@@ -3,14 +3,27 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any, Iterator
 
+import snowballstemmer
 from openai import OpenAI
 from qdrant_client import QdrantClient
 from rank_bm25 import BM25Okapi
 
 _RRF_K = 60  # constant from the RRF paper (Cormack et al. 2009)
+
+# Shared tokenizer for BM25: lowercase, split on non-alphanumerics, then stem so
+# morphological variants collapse to one token (appointed/appoints/appointment ->
+# appoint). This closes the lexical gap that caused phrasing-sensitive retrieval.
+_STEMMER = snowballstemmer.stemmer("english")
+_TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+
+def tokenize(text: str) -> list[str]:
+    """Lowercase, extract alphanumeric tokens, and Porter-stem each one."""
+    return _STEMMER.stemWords(_TOKEN_RE.findall(text.lower()))
 
 
 def load_chunks_jsonl(path: Path) -> Iterator[dict[str, Any]]:
@@ -49,7 +62,7 @@ class HybridRetriever:
             c["id"]: c["text"] for c in all_chunks if c.get("content_type") == "parent"
         }
 
-        tokenized_corpus = [c["text"].lower().split() for c in self._chunks]
+        tokenized_corpus = [tokenize(c["text"]) for c in self._chunks]
         self._bm25 = BM25Okapi(tokenized_corpus)
         # Fast lookup: chunk id → index in self._chunks
         self._chunk_index: dict[str, int] = {c["id"]: i for i, c in enumerate(self._chunks)}
@@ -99,7 +112,7 @@ class HybridRetriever:
         return ranks, payloads
 
     def _bm25_search(self, query: str, top_k: int) -> dict[str, int]:
-        scores = self._bm25.get_scores(query.lower().split())
+        scores = self._bm25.get_scores(tokenize(query))
         top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k]
         return {self._chunks[i]["id"]: rank for rank, i in enumerate(top_indices)}
 
