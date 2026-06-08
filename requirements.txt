@@ -4,5 +4,11 @@ pydantic-settings>=2.0
 python-dotenv>=1.0
 PyYAML>=6.0
 pymupdf>=1.24
+openai>=1.30
+qdrant-client>=1.9
+rank-bm25>=0.2
+snowballstemmer>=2.2
+fastapi>=0.110
+uvicorn[standard]>=0.29
 
 # Dev (optional): pip install -r requirements-dev.txt

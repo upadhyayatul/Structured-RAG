@@ -2,7 +2,7 @@
 
 Structured **retrieval-augmented generation (RAG)** for massive UPSC polity textbooks—starting with *Indian Polity* (6th ed.) by M. Laxmikanth (~1,500 pages).
 
-Unlike naive RAG (fixed-size text splits), this project preserves the book’s hierarchy—**PART → Chapter → Section**—so retrieval returns contextually correct snippets (e.g. Fundamental Rights vs Centre–State relations) with citations.
+Unlike naive RAG (fixed-size text splits), this project preserves the book’s hierarchy—**PART → Chapter → Section**—so retrieval returns contextually correct snippets (e.g. Fundamental Rights vs Centre–State relations) with page citations. A FastAPI backend serves the pipeline over HTTP, and a Next.js chat UI streams grounded answers token-by-token.
 
 ---
 
@@ -14,264 +14,206 @@ flowchart LR
   Parse --> TOC[TOC + sections]
   TOC --> Chunk[chunking/]
   Chunk --> Enrich[enrichment/]
-  Enrich --> Index[indexing/]
-  Index --> Retrieve[retrieval/]
-  Retrieve --> Gen[generation/]
-  Gen --> Answer[Grounded answer]
+  Enrich --> Index[indexing/ + Qdrant]
+  Index --> Retrieve[retrieval/ hybrid]
+  Retrieve --> Gen[generation/ LLM]
+  Gen --> API[FastAPI /ask]
+  API --> UI[Next.js chat UI]
 ```
 
-| Stage | Package | Purpose |
-|-------|---------|---------|
-| 1. Parse | `parsing/` | Extract text from PDF pages (PyMuPDF) |
-| 2. Structure | `parsing/toc.py` | Build PART / chapter / section tree from Contents |
-| 3. Chunk | `chunking/` | Split text inside section boundaries with overlap |
-| 4. Enrich | `enrichment/` | Add syllabus tags, entities, content types |
-| 5. Index | `indexing/` | Save `chunks.jsonl`; later vector + BM25 stores |
-| 6. Retrieve | `retrieval/` | Hybrid search + rerank (planned) |
-| 7. Answer | `generation/` | LLM prompt with cited sources (planned) |
+| Stage | Package | Purpose | Status |
+|-------|---------|---------|--------|
+| 1. Parse | `parsing/` | Extract text from PDF pages (PyMuPDF) | ✅ Done |
+| 2. Structure | `parsing/toc.py`, `align.py` | Build PART / chapter / section tree from Contents | ✅ Done |
+| 3. Chunk | `chunking/` | Split text inside section boundaries with overlap | ✅ Done |
+| 4. Enrich | `enrichment/` | Add syllabus tags, entities, content types | ✅ Done |
+| 5. Index | `indexing/` | Save `chunks.jsonl`; embed + upsert to Qdrant | ✅ Done |
+| 6. Retrieve | `retrieval/` | Dense (Qdrant) + BM25 hybrid search, RRF fusion | ✅ Done |
+| 7. Answer | `generation/` | LLM prompt with cited sources (OpenAI) | ✅ Done |
+| 8. Serve | `api/` | FastAPI `/ask` + streaming `/ask/stream` | ✅ Done |
+| 9. UI | `web/` | Next.js streaming chat with citations | ✅ Done |
+| 10. Evaluate | — | Eval harness on UPSC past questions | ⏳ Planned |
 
-**Current status:** Config, PDF parsing, chunking utilities, and ingest skeleton are in place. Full TOC → section → chunk export and vector retrieval are next.
+**Current status:** Full pipeline works end-to-end — ingest → embed → hybrid retrieve → LLM answer, exposed via FastAPI and a Next.js chat UI with token streaming. Evaluation harness is next. See `progress.json` for details.
+
+---
+
+## Architecture
+
+```
+Browser (Next.js chat)            FastAPI (Python)               Services
+┌────────────────────┐  POST     ┌──────────────────────┐
+│ web/app/page.tsx    │ /api/ask  │ /ask        (JSON)   │
+│  - streams tokens   │ ────────► │ /ask/stream (NDJSON) │ ──► Qdrant  :6333
+│  - markdown answers │ (route    │   HybridRetriever    │ ──► OpenAI  (embed + chat)
+│  - source citations │  handler  │   generate_answer()  │
+└────────────────────┘  pipes    └──────────────────────┘
+```
+
+The Next.js route handler (`web/app/api/ask/route.ts`) is a same-origin proxy that forwards to FastAPI and pipes the NDJSON stream back — so the browser never deals with CORS and the backend URL stays server-side.
+
+---
+
+## Quick start
+
+Prereqs: Python 3.13 venv, Node 18+, Docker (for Qdrant), and an `OPENAI_API_KEY` in `.env`.
+
+```powershell
+# 1. Start Qdrant (vector DB)
+docker run -d -p 6333:6333 -v qdrant_storage:/qdrant/storage --name qdrant qdrant/qdrant
+
+# 2. Build the index (once): parse + chunk, then embed + upsert
+python scripts/ingest.py --book laxmikanth_6
+python scripts/embed.py  --book laxmikanth_6
+
+# 3. Start the API backend
+python -m uvicorn upsc_rag.api.app:app --reload --port 8000
+
+# 4. Start the frontend (in another terminal)
+cd web
+npm install      # first time only
+npm run dev      # opens http://localhost:3000
+```
+
+Ask a question in the browser, or hit the API directly at **http://localhost:8000/docs**.
 
 ---
 
 ## Project layout
 
 ```
-UPSC-RAG/
-├── .env.example              # Environment variable template (copy to .env)
-├── .gitignore                # Ignores venv, caches, processed data, vector DB dirs
-├── pyproject.toml            # Package metadata, dependencies, CLI entry point
-├── requirements.txt          # Runtime dependencies (mirrors pyproject.toml)
-├── requirements-dev.txt      # Dev deps + editable install (`pip install -e .`)
+Structured-RAG/
+├── .env                      # OPENAI_API_KEY (gitignored)
+├── pyproject.toml            # Package metadata, dependencies
+├── requirements.txt          # Runtime dependencies
+├── requirements-dev.txt      # Dev deps + editable install
+├── progress.json             # Stage-by-stage status (source of truth)
+├── CLAUDE.md                 # Quick reference for the codebase
 ├── README.md                 # This file
 │
-├── config/                   # YAML configuration (no secrets)
-│   ├── default.yaml          # Global defaults for all books
+├── config/
+│   ├── default.yaml          # Global defaults (chunking, indexing, retrieval, generation)
 │   └── books/
-│       └── laxmikanth_6.yaml # Book-specific PDF path, structure, exclusions
+│       └── laxmikanth_6.yaml # Book PDF path, page ranges, structure regex
 │
-├── data/                     # Data on disk (not the Python package)
-│   ├── raw/                  # Optional folder for future source PDFs
-│   ├── *.pdf                 # Your textbook PDF(s) (e.g. Laxmikanth)
-│   └── processed/            # Generated artifacts per book (gitignored)
-│       └── laxmikanth_6/
-│           ├── manifest.json # Book metadata + page count from ingest
-│           └── chunks.jsonl  # One JSON object per chunk (main index input)
+├── data/processed/laxmikanth_6/
+│   ├── manifest.json         # Book metadata + page count
+│   ├── toc.json              # Parsed TOC tree (cached)
+│   └── chunks.jsonl          # Parent + child chunks (index input)
 │
-├── scripts/
-│   └── ingest.py             # Thin CLI: runs the ingest pipeline
+├── scripts/                  # Thin CLI wrappers
+│   ├── calibrate_pages.py    # Verify PDF page ranges before ingest
+│   ├── ingest.py             # Parse + chunk → chunks.jsonl
+│   ├── embed.py              # Embed children + upsert to Qdrant
+│   ├── retrieve.py           # Run a hybrid query, print ranked results
+│   └── ask.py                # Retrieve → generate → print cited answer
 │
-├── src/upsc_rag/             # Main Python package (installed editable)
-│   ├── __init__.py           # Package version
+├── src/upsc_rag/             # Main Python package
 │   ├── config.py             # Load YAML + .env; resolve paths
-│   ├── parsing/              # PDF and table-of-contents logic
-│   ├── chunking/             # Hierarchy-aware text splitting
-│   ├── enrichment/           # Extra metadata before indexing
-│   ├── indexing/             # Persist chunks (JSONL today; vectors later)
-│   ├── retrieval/            # Load/search chunks (hybrid search planned)
-│   ├── generation/           # Build grounded LLM prompts
-│   └── pipeline/             # Orchestrates end-to-end ingest
+│   ├── parsing/              # PDF + TOC + alignment
+│   ├── chunking/             # Hierarchy-aware splitting
+│   ├── enrichment/           # syllabus_tags, entities
+│   ├── indexing/             # JSONL store, OpenAI embedder, Qdrant store
+│   ├── retrieval/            # HybridRetriever (dense + BM25 + RRF)
+│   ├── generation/           # build_answer_prompt, generate_answer[_stream]
+│   ├── api/                  # FastAPI app (/ask, /ask/stream, /health)
+│   └── pipeline/             # run_ingest, run_embed orchestration
 │
-├── tests/                    # Pytest suite
-│   ├── conftest.py           # Adds `src/` to Python path
-│   ├── test_config.py        # Config loading smoke tests
-│   └── test_chunking.py      # Chunking + entity extraction tests
+├── web/                      # Next.js 16 frontend (React 19, TS, Tailwind v4)
+│   ├── app/page.tsx          # Streaming chat UI
+│   ├── app/api/ask/route.ts  # BFF proxy → FastAPI stream
+│   ├── app/types.ts          # Shared AskResponse/Source types
+│   └── .env.local            # BACKEND_URL (default http://localhost:8000)
 │
-└── .venv/                    # Local virtual environment (gitignored)
+└── tests/                    # Pytest suite
 ```
-
----
-
-## Root files
-
-| File | Description |
-|------|-------------|
-| **`.env.example`** | Template for environment variables. Copy to `.env` to override paths (`UPSC_RAG_DATA_DIR`, `UPSC_RAG_PROCESSED_DIR`) and later API keys for embeddings/LLMs. |
-| **`.gitignore`** | Keeps `.venv`, `__pycache__`, `.env`, test caches, vector DB folders (`chroma/`, `qdrant_storage/`), and `data/processed/` out of version control. |
-| **`pyproject.toml`** | Defines the `upsc-rag` package (Python ≥3.11), dependencies, pytest/ruff settings, and the `upsc-rag-ingest` console script. |
-| **`requirements.txt`** | Runtime pins: `pydantic`, `pydantic-settings`, `python-dotenv`, `PyYAML`, `pymupdf`. |
-| **`requirements-dev.txt`** | Installs runtime deps plus `pytest`, `ruff`, and the project in editable mode. |
 
 ---
 
 ## `config/` — YAML settings
 
-Configuration is split so one codebase can ingest many books.
+Configuration is split so one codebase can ingest many books. `default.yaml` holds shared defaults; `books/<id>.yaml` holds per-book overrides (PDF path, page ranges, structure regex). They are deep-merged at load time.
 
-### `config/default.yaml`
-
-Shared defaults merged into every book config:
+### Key `default.yaml` blocks
 
 | Key | Meaning |
 |-----|---------|
-| `project.processed_dir` | Where generated files are written (`data/processed`) |
-| `parsing.content_start_page` | First page of main body (overridden per book) |
-| `chunking.child_chunk_tokens` | Target size for child chunks (~600 tokens) |
-| `chunking.child_chunk_overlap` | Overlap between consecutive chunks in the same section |
-| `chunking.min_chunk_chars` | Minimum chunk length to avoid tiny fragments |
-| `indexing.collection_name` | Name for the future vector collection |
-| `retrieval.top_k` / `rerank_top_k` | How many chunks to retrieve and rerank |
+| `chunking.child_chunk_tokens` / `child_chunk_overlap` | Child chunk size (~600 tokens) and overlap |
+| `indexing.collection_name` | Qdrant collection (`upsc_polity`) |
+| `indexing.embedding_model` / `embedding_dim` | `text-embedding-3-large`, 3072-dim, cosine |
+| `indexing.qdrant_url` | `http://localhost:6333` |
+| `retrieval.top_k` / `rerank_top_k` | Candidate pool size and final results |
+| `generation.model` / `temperature` / `max_tokens` | LLM settings (`gpt-4o-mini`) |
 
-### `config/books/laxmikanth_6.yaml`
-
-Book-specific overrides:
-
-| Key | Meaning |
-|-----|---------|
-| `book.id` | Identifier used in CLI (`--book laxmikanth_6`) and output paths |
-| `book.pdf_path` | Path to the PDF relative to project root |
-| `parsing.content_start_page` | First page of chapter body (after front matter and Contents) |
-| `parsing.content_end_page` | Last page of chapter body (before appendices / index) |
-| `structure.part_pattern` | Regex to detect `PART-I`, `PART-II`, etc. |
-| `structure.chapter_pattern` | Regex to detect numbered chapters (`7 Fundamental Rights`) |
-
-Add new books by creating `config/books/<book_id>.yaml`.
+Add new books by creating `config/books/<book_id>.yaml` (see "Adding a new book" in `CLAUDE.md`).
 
 ---
 
-## `data/` — inputs and outputs
+## Chunk schema (`chunks.jsonl`)
 
-| Path | Description |
-|------|-------------|
-| **`data/raw/`** | Optional staging area for PDFs you add later. The Laxmikanth file currently lives at `data/M laxmikanth 6th edition.pdf` as configured in YAML. |
-| **`data/processed/<book_id>/`** | All generated artifacts for one book. Regenerated by ingest; safe to delete and rebuild. |
-| **`manifest.json`** | Written by ingest: `book_id`, title, resolved PDF path, `page_count`. |
-| **`chunks.jsonl`** | Newline-delimited JSON—one record per chunk. Primary input for indexing and retrieval. |
-
-Example chunk record (target schema):
+One JSON object per line:
 
 ```json
 {
-  "id": "ch07_right_to_equality_003_a1b2c3",
+  "id": "sec_0002_001_6c6329fcfb10",
   "text": "...",
   "book_id": "laxmikanth_6",
   "part": "PART-I",
-  "chapter_num": 7,
-  "chapter_title": "Fundamental Rights",
-  "section_path": ["Fundamental Rights", "Right to Equality"],
-  "page_start": 112,
-  "page_end": 118,
-  "content_type": "body",
-  "entities": ["Article 14", "Article 15"]
+  "chapter_num": 1,
+  "chapter_title": "Historical Background",
+  "section_path": ["PART-I", "1 Historical Background", "The Company Rule (1773–1858)"],
+  "page_start": 49,
+  "page_end": 53,
+  "content_type": "child",
+  "parent_id": "sec_0002",
+  "entities": ["Article 14"]
 }
 ```
 
----
-
-## `src/upsc_rag/` — Python package
-
-### `config.py`
-
-Central configuration loader:
-
-- **`AppSettings`** — Reads `.env` with prefix `UPSC_RAG_` (e.g. `UPSC_RAG_PROCESSED_DIR`).
-- **`BookConfig`** — Validated book metadata (id, title, author, edition, `pdf_path`).
-- **`load_runtime_config(book_id)`** — Deep-merges `default.yaml` + `books/<book_id>.yaml`.
-- **`PROJECT_ROOT`** — Absolute path to the repo root for resolving relative paths.
-
-### `parsing/` — PDF extraction and structure
-
-| Module | Description |
-|--------|-------------|
-| **`pdf.py`** | Opens PDFs with PyMuPDF (`fitz`). `extract_page_text()` returns plain text for a 1-based page. `iter_pages()` streams page number + text for a range. |
-| **`toc.py`** | Parses the book **Contents** pages into a tree (`TocNode`: PART → chapter → subsection). Uses regex for `PART-I` and numbered chapters. Page boundaries are assigned in a later ingest step. |
-
-### `chunking/` — Structured splits
-
-| Module | Description |
-|--------|-------------|
-| **`structured.py`** | **`ChunkRecord`** dataclass holds chunk text plus hierarchy metadata. **`chunk_section_text()`** splits within a section using paragraph boundaries and token estimates—not arbitrary character cuts. **`extract_entities()`** pulls references like `Article 14` for filtering and citations. |
-
-### `enrichment/` — Metadata tags
-
-| Module | Description |
-|--------|-------------|
-| **`metadata.py`** | **`enrich_chunk()`** adds derived fields before indexing (e.g. `syllabus_tags: ["GS2_Polity"]`). Will grow to support content types (`body`, `table`, `mcq`) and exam focus. |
-
-### `indexing/` — Persistence
-
-| Module | Description |
-|--------|-------------|
-| **`store.py`** | **`save_chunks_jsonl()`** writes chunk dicts to JSONL. Future: Chroma/Qdrant/pgvector with the same metadata payload. |
-
-### `retrieval/` — Search (planned)
-
-| Module | Description |
-|--------|-------------|
-| **`hybrid.py`** | **`load_chunks_jsonl()`** reads chunks back from disk. Will add BM25 + dense vectors + reranking per `config/default.yaml`. |
-
-### `generation/` — Answers (planned)
-
-| Module | Description |
-|--------|-------------|
-| **`answer.py`** | **`build_answer_prompt()`** formats retrieved chunks with source numbers and chapter/page citations for a grounded LLM response. |
-
-### `pipeline/` — Orchestration
-
-| Module | Description |
-|--------|-------------|
-| **`ingest.py`** | **`run_ingest(book_id)`** runs the full ingest: load config → open PDF → write `manifest.json` → (future) TOC + chunk → `chunks.jsonl`. **`main()`** exposes CLI flags `--book` and `--output`. |
-
-Registered as console script: **`upsc-rag-ingest`**.
+**Parent chunks** = full section text (stored as `parent_text` in the Qdrant payload, not embedded).
+**Child chunks** = overlapping ~600-token splits, embedded into Qdrant for precise retrieval. On a hit, the parent text is returned for full context.
 
 ---
 
-## `scripts/` — Command-line entry
+## API
 
-| File | Description |
-|------|-------------|
-| **`ingest.py`** | Wrapper so you can run `python scripts/ingest.py` without remembering module paths. Delegates to `upsc_rag.pipeline.ingest:main`. |
+| Endpoint | Method | Returns |
+|----------|--------|---------|
+| `/health` | GET | Liveness + which book is loaded |
+| `/ask` | POST | `{ answer, sources[] }` (complete JSON) |
+| `/ask/stream` | POST | NDJSON event stream: one `sources` event, then `token` events, then `done` |
 
----
+Request body: `{ "query": "...", "top_k"?: int, "rerank_top_k"?: int }`.
+The retriever is built once at startup (FastAPI lifespan) and reused per request. Sources are deduplicated by section + page range and renumbered.
 
-## `tests/` — Quality checks
-
-| File | Description |
-|------|-------------|
-| **`conftest.py`** | Ensures `src/` is on `sys.path` for pytest. |
-| **`test_config.py`** | Verifies project root exists and Laxmikanth YAML loads correctly. |
-| **`test_chunking.py`** | Tests entity regex and that `chunk_section_text()` yields valid `ChunkRecord`s. |
-
----
-
-## Setup
-
-```powershell
-cd p:\ML-AI\projects\UPSC-RAG
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements-dev.txt
-```
-
-Optional: copy environment template and adjust paths.
-
-```powershell
-copy .env.example .env
-```
+Interactive docs: **http://localhost:8000/docs**.
 
 ---
 
 ## Commands
 
-**Run ingest** (validates PDF, writes manifest; chunk export still stub):
-
 ```powershell
+# Verify PDF page ranges before ingest
+python scripts/calibrate_pages.py --book laxmikanth_6
+
+# Ingest (parse + chunk) → chunks.jsonl
 python scripts/ingest.py --book laxmikanth_6
-# equivalent:
-upsc-rag-ingest --book laxmikanth_6
-```
 
-**Run tests:**
+# Embed children + upsert to Qdrant
+python scripts/embed.py --book laxmikanth_6
 
-```powershell
+# Hybrid retrieval (print ranked chunks)
+python scripts/retrieve.py "How is the Constitution amended?"
+
+# Full answer in the terminal (retrieve → generate)
+python scripts/ask.py "How is the Constitution amended?" --rerank 5
+
+# Run tests
 pytest
 ```
 
-**Lint (optional):**
-
-```powershell
-ruff check src tests scripts
-```
+> **Venv note:** this `.venv` was cloned from another project, so always install with
+> `python -m pip install ...` (not bare `pip`). See `CLAUDE.md` for details.
 
 ---
 
@@ -279,16 +221,22 @@ ruff check src tests scripts
 
 1. **Structure first** — Chunk inside TOC sections, not across chapter boundaries.
 2. **Rich metadata** — Every chunk carries `part`, `chapter`, `section_path`, pages, and entities for filtered retrieval.
-3. **Config-driven books** — New textbooks = new YAML under `config/books/`, same code path.
-4. **Reproducible artifacts** — `data/processed/` can be deleted and rebuilt from the PDF + config.
-5. **Incremental build** — JSONL indexing works before vector DBs; embeddings and hybrid search plug in later.
+3. **Parent-child retrieval** — Embed children for precision, return the parent for full context.
+4. **Config-driven books** — New textbooks = new YAML under `config/books/`, same code path.
+5. **Reproducible artifacts** — `data/processed/` can be deleted and rebuilt from the PDF + config.
+6. **Layered** — CLI, API, and UI all call the same core (`HybridRetriever` + `generate_answer`); no duplicated logic.
 
 ---
 
 ## Roadmap
 
-- [ ] Wire TOC page-range detection and section body extraction
-- [ ] Populate `chunks.jsonl` from Laxmikanth hierarchy
-- [ ] Vector store + BM25 hybrid retrieval
-- [ ] Reranker + `generation/` LLM integration
+- [x] TOC page-range detection and section body extraction
+- [x] Populate `chunks.jsonl` from Laxmikanth hierarchy
+- [x] Vector store (Qdrant) + BM25 hybrid retrieval with RRF
+- [x] `generation/` LLM integration (OpenAI, grounded + cited)
+- [x] FastAPI backend with token streaming
+- [x] Next.js streaming chat UI with markdown + citations
 - [ ] Evaluation set from chapter MCQs / past UPSC questions
+- [ ] Reranker (cross-encoder) on top of RRF candidates
+- [ ] Multi-book support in the UI (book selector)
+```

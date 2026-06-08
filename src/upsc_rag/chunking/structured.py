@@ -1,3 +1,4 @@
+"""Split section text into a parent ChunkRecord plus overlapping child ChunkRecords for indexing."""
 from __future__ import annotations
 
 import hashlib
@@ -8,6 +9,13 @@ from typing import Any, Iterator
 
 @dataclass
 class ChunkRecord:
+    """
+    One indexable text unit.
+
+    ``content_type="parent"`` stores the full section text (not embedded).
+    ``content_type="child"`` stores an overlapping ~600-token split (embedded into Qdrant).
+    """
+
     id: str
     text: str
     book_id: str
@@ -22,6 +30,7 @@ class ChunkRecord:
     entities: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
+        """Serialize to a plain dict for JSONL writing."""
         return asdict(self)
 
 
@@ -29,10 +38,12 @@ _ARTICLE_RE = re.compile(r"\bArticle\s+\d+[A-Z]?\b", re.I)
 
 
 def extract_entities(text: str) -> list[str]:
+    """Return a sorted, deduplicated list of 'Article NNN' references found in text."""
     return sorted({m.group(0) for m in _ARTICLE_RE.finditer(text)})
 
 
 def _token_estimate(text: str) -> int:
+    """Cheap token estimate: len / 4, avoiding a full tokenizer dependency."""
     return max(1, len(text) // 4)
 
 
@@ -45,8 +56,29 @@ def chunk_section_text(
     overlap_tokens: int = 80,
     metadata: dict[str, Any] | None = None,
 ) -> Iterator[ChunkRecord]:
-    """Split section text into overlapping chunks without crossing paragraph boundaries."""
+    """
+    Yield one parent chunk (full section) followed by overlapping child chunks.
+
+    Splits at paragraph boundaries so no paragraph is ever cut mid-sentence.
+    The parent is not embedded; children are embedded and point back to the parent
+    via parent_id for context expansion at retrieval time.
+    """
     meta = metadata or {}
+    meta_filtered = {k: v for k, v in meta.items() if k in ChunkRecord.__dataclass_fields__}
+    
+    parent_id = section_id
+    parent_meta = dict(meta_filtered)
+    parent_meta["content_type"] = "parent"
+    parent_meta["parent_id"] = None
+    
+    yield ChunkRecord(
+        id=parent_id,
+        text=text,
+        book_id=book_id,
+        entities=extract_entities(text),
+        **parent_meta,
+    )
+
     paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
     if not paragraphs:
         return
@@ -54,6 +86,10 @@ def chunk_section_text(
     buffer: list[str] = []
     buffer_tokens = 0
     chunk_index = 0
+    
+    child_meta = dict(meta_filtered)
+    child_meta["content_type"] = "child"
+    child_meta["parent_id"] = parent_id
 
     def flush() -> ChunkRecord | None:
         nonlocal chunk_index, buffer, buffer_tokens
@@ -67,7 +103,7 @@ def chunk_section_text(
             text=body,
             book_id=book_id,
             entities=extract_entities(body),
-            **{k: v for k, v in meta.items() if k in ChunkRecord.__dataclass_fields__},
+            **child_meta,
         )
         chunk_index += 1
         return record

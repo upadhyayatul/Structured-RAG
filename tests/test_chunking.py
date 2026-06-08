@@ -1,3 +1,8 @@
+"""
+Unit tests for the chunking module.
+Ensures that structured text chunking and entity extraction
+functions operate correctly and produce expected outputs.
+"""
 from upsc_rag.chunking.structured import chunk_section_text, extract_entities
 
 
