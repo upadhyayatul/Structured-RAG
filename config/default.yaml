@@ -25,6 +25,7 @@ retrieval:
     enabled: true          # LLM query rewriting: expand synonyms/abbreviations, multi-query retrieval
     num_variants: 3        # number of rephrasings to add alongside the original query
     model: gpt-4.1-nano
+    score_threshold: 0.55  # gate: skip rewrite when original query's top dense cosine >= this (first pass already good)
 
 generation:
   model: gpt-4o-mini

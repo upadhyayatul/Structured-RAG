@@ -55,6 +55,10 @@ class HybridRetriever:
         self._rewrite_enabled: bool = bool(rewrite_cfg.get("enabled", False))
         self._rewrite_num_variants: int = rewrite_cfg.get("num_variants", 3)
         self._rewrite_model: str = rewrite_cfg.get("model", "gpt-4o-mini")
+        # Gate: skip the rewrite LLM call + variant embeds when the original query's
+        # top dense cosine score already clears this bar (the first pass is "good
+        # enough"). Only weak first passes pay for query expansion.
+        self._rewrite_score_threshold: float = rewrite_cfg.get("score_threshold", 0.5)
 
         self._qdrant = QdrantClient(url=indexing_cfg["qdrant_url"])
         self._openai = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
@@ -91,23 +95,26 @@ class HybridRetriever:
         top_k = top_k if top_k is not None else self._default_top_k
         rerank_top_k = rerank_top_k if rerank_top_k is not None else self._default_rerank_top_k
 
-        queries = self._expand_queries(query)
+        # First pass: original query only (one embed). Cheap, and often enough.
+        dense_ranks, payloads, top_score = self._dense_search(query, top_k)
+        rank_lists: list[dict[str, int]] = [dense_ranks, self._bm25_search(query, top_k)]
+        qdrant_payloads: dict[str, dict] = dict(payloads)
 
-        # Each query variant needs an OpenAI embedding round-trip; running them
-        # sequentially stacks the network latency. Fan out across a thread pool so
-        # the (I/O-bound) embed + Qdrant + BM25 work for all variants overlaps.
-        if len(queries) == 1:
-            per_query = [self._search_one(queries[0], top_k)]
-        else:
-            with ThreadPoolExecutor(max_workers=len(queries)) as pool:
-                per_query = list(pool.map(lambda q: self._search_one(q, top_k), queries))
-
-        rank_lists: list[dict[str, int]] = []
-        qdrant_payloads: dict[str, dict] = {}
-        for dense_ranks, bm25_ranks, payloads in per_query:
-            rank_lists.append(dense_ranks)
-            rank_lists.append(bm25_ranks)
-            qdrant_payloads.update(payloads)
+        # Gate: only expand with rewrite variants when the first pass looks weak.
+        # A strong top dense score means we already found the right section, so we
+        # skip the rewrite LLM call + extra embeds entirely.
+        if self._rewrite_enabled and top_score < self._rewrite_score_threshold:
+            variants = [v for v in self._expand_queries(query) if v != query]
+            if variants:
+                # Each variant needs its own OpenAI embedding round-trip; fan them
+                # out across a thread pool so the I/O-bound work overlaps.
+                with ThreadPoolExecutor(max_workers=len(variants)) as pool:
+                    for d_ranks, b_ranks, pls in pool.map(
+                        lambda q: self._search_one(q, top_k), variants
+                    ):
+                        rank_lists.append(d_ranks)
+                        rank_lists.append(b_ranks)
+                        qdrant_payloads.update(pls)
 
         fused = self._rrf_fuse(rank_lists)
         top_ids = sorted(fused, key=lambda cid: fused[cid], reverse=True)[:rerank_top_k]
@@ -135,13 +142,13 @@ class HybridRetriever:
         self, query: str, top_k: int
     ) -> tuple[dict[str, int], dict[str, int], dict[str, dict]]:
         """Run dense + BM25 for a single query variant (called concurrently per variant)."""
-        dense_ranks, payloads = self._dense_search(query, top_k)
+        dense_ranks, payloads, _ = self._dense_search(query, top_k)
         bm25_ranks = self._bm25_search(query, top_k)
         return dense_ranks, bm25_ranks, payloads
 
     def _dense_search(
         self, query: str, top_k: int
-    ) -> tuple[dict[str, int], dict[str, dict]]:
+    ) -> tuple[dict[str, int], dict[str, dict], float]:
         query_vector = self._embed_query(query)
         response = self._qdrant.query_points(
             collection_name=self._collection,
@@ -152,7 +159,8 @@ class HybridRetriever:
         hits = response.points
         ranks = {hit.payload["chunk_id"]: rank for rank, hit in enumerate(hits)}
         payloads = {hit.payload["chunk_id"]: hit.payload for hit in hits}
-        return ranks, payloads
+        top_score = hits[0].score if hits else 0.0
+        return ranks, payloads, top_score
 
     def _bm25_search(self, query: str, top_k: int) -> dict[str, int]:
         scores = self._bm25.get_scores(tokenize(query))
