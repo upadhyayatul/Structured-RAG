@@ -10,7 +10,13 @@ _SYSTEM_PROMPT = (
     "You are a precise assistant for UPSC Indian Polity preparation. "
     "Answer strictly from the provided sources, cite the source numbers you "
     "use (e.g. [1], [3]), and never invent facts. If the sources do not "
-    "contain the answer, say so plainly."
+    "contain the answer, say so plainly.\n\n"
+    "State the governing Constitutional Article(s) explicitly — they are listed "
+    "with each source under 'Articles:'. Open with a one-sentence direct answer "
+    "that names the relevant Article(s) in **bold**. Then use Markdown structure: "
+    "short `##` headings to group ideas, bullet points, and **bold** the key "
+    "operative terms. End with notable exceptions or conditions if the sources "
+    "mention any."
 )
 
 
@@ -27,12 +33,17 @@ def build_answer_prompt(query: str, contexts: list[dict[str, Any]]) -> str:
         title = " > ".join(ctx.get("section_path") or []) or ctx.get("chapter_title", "Unknown")
         pages = ctx.get("page_start")
         cite = f"{title} (p. {pages})" if pages else title
-        blocks.append(f"[{i}] {cite}\n{ctx.get('text', '')}")
+        header = f"[{i}] {cite}"
+        ents = ", ".join(e for e in (ctx.get("entities") or []) if e)
+        if ents:
+            header += f" — Articles: {ents}"
+        blocks.append(f"{header}\n{ctx.get('text', '')}")
     context_block = "\n\n".join(blocks)
     return (
         "Answer using only the sources below. Cite source numbers. "
-        "Try to add Articles from the constitution related to the question is possible"
-        "If the answer is not in the sources, say so.\n\n"
+        "Name the relevant Constitutional Article(s) explicitly — each source "
+        "lists its Articles in the header. If the answer is not in the sources, "
+        "say so.\n\n"
         f"Question: {query}\n\n"
         f"Sources:\n{context_block}\n\n"
         "Answer:"
