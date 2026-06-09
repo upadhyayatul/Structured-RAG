@@ -13,6 +13,8 @@ from openai import OpenAI
 from qdrant_client import QdrantClient
 from rank_bm25 import BM25Okapi
 
+from upsc_rag.chunking.structured import extract_entities
+
 _RRF_K = 60  # constant from the RRF paper (Cormack et al. 2009)
 
 # Shared tokenizer for BM25: lowercase, split on non-alphanumerics, then stem so
@@ -204,7 +206,10 @@ class HybridRetriever:
             "part": p.get("part"),
             "page_start": p.get("page_start"),
             "page_end": p.get("page_end"),
-            "entities": p.get("entities", []),
+            # Extract Articles from the text actually returned (parent section), not the
+            # embedded child span — the child often omits the reference that the parent
+            # carries, so the payload's child-level entities are misleadingly empty.
+            "entities": extract_entities(text),
             "rrf_score": round(rrf_score, 6),
         }
 
