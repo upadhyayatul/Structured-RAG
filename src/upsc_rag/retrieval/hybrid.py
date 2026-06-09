@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -92,12 +93,20 @@ class HybridRetriever:
 
         queries = self._expand_queries(query)
 
+        # Each query variant needs an OpenAI embedding round-trip; running them
+        # sequentially stacks the network latency. Fan out across a thread pool so
+        # the (I/O-bound) embed + Qdrant + BM25 work for all variants overlaps.
+        if len(queries) == 1:
+            per_query = [self._search_one(queries[0], top_k)]
+        else:
+            with ThreadPoolExecutor(max_workers=len(queries)) as pool:
+                per_query = list(pool.map(lambda q: self._search_one(q, top_k), queries))
+
         rank_lists: list[dict[str, int]] = []
         qdrant_payloads: dict[str, dict] = {}
-        for q in queries:
-            dense_ranks, payloads = self._dense_search(q, top_k)
+        for dense_ranks, bm25_ranks, payloads in per_query:
             rank_lists.append(dense_ranks)
-            rank_lists.append(self._bm25_search(q, top_k))
+            rank_lists.append(bm25_ranks)
             qdrant_payloads.update(payloads)
 
         fused = self._rrf_fuse(rank_lists)
@@ -121,6 +130,14 @@ class HybridRetriever:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _search_one(
+        self, query: str, top_k: int
+    ) -> tuple[dict[str, int], dict[str, int], dict[str, dict]]:
+        """Run dense + BM25 for a single query variant (called concurrently per variant)."""
+        dense_ranks, payloads = self._dense_search(query, top_k)
+        bm25_ranks = self._bm25_search(query, top_k)
+        return dense_ranks, bm25_ranks, payloads
 
     def _dense_search(
         self, query: str, top_k: int
