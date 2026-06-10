@@ -17,6 +17,8 @@ def main() -> None:
     parser.add_argument("--book", default="laxmikanth_6")
     parser.add_argument("--rerank", type=int, default=None, help="Top-k results to score")
     parser.add_argument("--no-rewrite", action="store_true", help="Disable query rewriting for this run")
+    parser.add_argument("--no-graph", action="store_true", help="Disable graph expansion for this run")
+    parser.add_argument("--no-catalog", action="store_true", help="Disable chapter article-catalog enrichment for this run")
     parser.add_argument("--gold", default=None, help="Path to gold jsonl (default data/eval/<book>.jsonl)")
     args = parser.parse_args()
 
@@ -25,13 +27,20 @@ def main() -> None:
     if args.no_rewrite:
         cfg = {**cfg, "retrieval": {**cfg.get("retrieval", {}),
                                     "rewrite": {**cfg.get("retrieval", {}).get("rewrite", {}), "enabled": False}}}
+    if args.no_graph:
+        cfg = {**cfg, "retrieval": {**cfg.get("retrieval", {}),
+                                    "graph": {**cfg.get("retrieval", {}).get("graph", {}), "enabled": False}}}
+    if args.no_catalog:
+        cfg = {**cfg, "retrieval": {**cfg.get("retrieval", {}),
+                                    "catalog": {**cfg.get("retrieval", {}).get("catalog", {}), "enabled": False}}}
 
     processed = settings.resolve(settings.processed_dir) / args.book
     gold_path = Path(args.gold) if args.gold else settings.resolve(Path("data/eval")) / f"{args.book}.jsonl"
 
     gold = load_gold(gold_path)
     print(f"Loaded {len(gold)} gold questions from {gold_path}")
-    print(f"Rewrite: {'OFF' if args.no_rewrite else 'ON'}\n")
+    print(f"Rewrite: {'OFF' if args.no_rewrite else 'ON'}  |  Graph: {'OFF' if args.no_graph else 'ON'}"
+          f"  |  Catalog: {'OFF' if args.no_catalog else 'ON'}\n")
 
     retriever = HybridRetriever(cfg, processed / "chunks.jsonl")
     report = evaluate(retriever, gold, rerank_top_k=args.rerank)

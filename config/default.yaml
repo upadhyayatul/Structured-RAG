@@ -26,6 +26,13 @@ retrieval:
     num_variants: 3        # number of rephrasings to add alongside the original query
     model: gpt-4.1-nano
     score_threshold: 0.55  # gate: skip rewrite when original query's top dense cosine >= this (first pass already good)
+  graph:                   # Graph-RAG expansion: surface cross-referenced sections via shared Articles
+    enabled: false         # no-op on this corpus (article numbers absent from prose sections); see progress.json
+    seed_sections: 5       # use the top-N fused sections as expansion seeds
+    max_neighbors: 3       # add at most this many graph-related sections per query
+    rrf_weight: 1.0        # scales the graph neighbours' RRF contribution into the fusion
+  catalog:                 # attribute each chapter's 'Articles ... at a Glance' table to its sections
+    enabled: true          # recovers article numbers PDF extraction stripped from the catalogs
 
 generation:
   model: gpt-4o-mini

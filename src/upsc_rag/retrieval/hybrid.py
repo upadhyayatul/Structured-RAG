@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Iterator
@@ -62,6 +63,23 @@ class HybridRetriever:
         # enough"). Only weak first passes pay for query expansion.
         self._rewrite_score_threshold: float = rewrite_cfg.get("score_threshold", 0.5)
 
+        # Graph-RAG expansion: after fusion, walk the section<->article graph to pull
+        # in cross-referenced sections that share rare Articles with the top hits.
+        graph_cfg = retrieval_cfg.get("graph", {})
+        self._graph_enabled: bool = bool(graph_cfg.get("enabled", False))
+        self._graph_seed_sections: int = graph_cfg.get("seed_sections", 5)
+        self._graph_max_neighbors: int = graph_cfg.get("max_neighbors", 3)
+        self._graph_rrf_weight: float = graph_cfg.get("rrf_weight", 1.0)
+        self._graph = None
+
+        # Chapter-level article catalog: maps chapter_num -> {"Article 124", ...} parsed
+        # from each chapter's "Articles ... at a Glance" table. Used to attribute a
+        # chapter's governing articles to its sections (whose prose names the topic but
+        # not the article number). Built below once chunks are loaded.
+        catalog_cfg = retrieval_cfg.get("catalog", {})
+        self._catalog_enabled: bool = bool(catalog_cfg.get("enabled", False))
+        self._chapter_articles: dict[int, set[str]] = {}
+
         self._qdrant = QdrantClient(url=indexing_cfg["qdrant_url"])
         self._openai = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
@@ -78,6 +96,32 @@ class HybridRetriever:
         self._bm25 = BM25Okapi(tokenized_corpus)
         # Fast lookup: chunk id → index in self._chunks
         self._chunk_index: dict[str, int] = {c["id"]: i for i, c in enumerate(self._chunks)}
+
+        # Map each parent section id → its child chunk ids, so a graph-expanded
+        # section can be represented in the fused candidate pool by a real child.
+        self._section_children: dict[str, list[str]] = defaultdict(list)
+        for c in self._chunks:
+            pid = c.get("parent_id")
+            if pid:
+                self._section_children[pid].append(c["id"])
+
+        if self._graph_enabled:
+            from upsc_rag.indexing.graph_store import load_graph
+
+            graph_path = chunks_path.parent / "graph.pkl"
+            if graph_path.exists():
+                self._graph = load_graph(graph_path)
+            else:
+                # Graph not built for this book — disable rather than fail.
+                self._graph_enabled = False
+
+        if self._catalog_enabled:
+            from upsc_rag.enrichment.articles_catalog import build_chapter_article_map
+
+            self._chapter_articles = {
+                ch: set(arts)
+                for ch, arts in build_chapter_article_map(all_chunks).items()
+            }
 
     # ------------------------------------------------------------------
     # Public API
@@ -119,6 +163,12 @@ class HybridRetriever:
                         qdrant_payloads.update(pls)
 
         fused = self._rrf_fuse(rank_lists)
+
+        # Graph-RAG: pull in cross-referenced sections sharing rare Articles with the
+        # top hits, fusing them into the scores so a strong signal can reach top-k.
+        if self._graph is not None:
+            self._graph_expand(fused, qdrant_payloads)
+
         top_ids = sorted(fused, key=lambda cid: fused[cid], reverse=True)[:rerank_top_k]
 
         return [
@@ -139,6 +189,44 @@ class HybridRetriever:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _parent_of(self, chunk_id: str, qdrant_payloads: dict[str, dict]) -> str | None:
+        """The parent section id of a fused chunk (from payload or in-memory chunk)."""
+        if chunk_id in qdrant_payloads:
+            return qdrant_payloads[chunk_id].get("parent_id")
+        idx = self._chunk_index.get(chunk_id)
+        if idx is not None:
+            return self._chunks[idx].get("parent_id")
+        return None
+
+    def _graph_expand(self, fused: dict[str, float], qdrant_payloads: dict[str, dict]) -> None:
+        """Mutate ``fused`` in place: add graph-related sections as new candidates.
+
+        Seeds are the parent sections of the current top fused chunks. Each neighbour
+        section returned by the graph is represented by one of its child chunks and
+        given an RRF contribution (scaled by ``graph.rrf_weight``) keyed off its graph
+        rank, so the strongest cross-references can climb into the final top-k.
+        """
+        from upsc_rag.indexing.graph_store import expand_sections
+
+        ranked = sorted(fused, key=lambda cid: fused[cid], reverse=True)
+        seeds: list[str] = []
+        seen: set[str] = set()
+        for cid in ranked[: self._graph_seed_sections]:
+            pid = self._parent_of(cid, qdrant_payloads)
+            if pid and pid not in seen:
+                seen.add(pid)
+                seeds.append(pid)
+
+        neighbours = expand_sections(
+            self._graph, seeds, max_neighbors=self._graph_max_neighbors
+        )
+        for rank, section_id in enumerate(neighbours):
+            children = self._section_children.get(section_id)
+            if not children:
+                continue
+            rep = children[0]
+            fused[rep] = fused.get(rep, 0.0) + self._graph_rrf_weight * _rrf_score(rank)
 
     def _search_one(
         self, query: str, top_k: int
@@ -197,6 +285,14 @@ class HybridRetriever:
             )
             p = chunk  # field names match except chunk_id vs id (handled below)
 
+        # Articles named in the returned text (parent section), not the embedded child
+        # span — the child often omits the reference the parent carries.
+        entities = set(extract_entities(text))
+        # Plus the chapter's catalog articles: Laxmikanth's prose names the topic but
+        # the article number lives only in the chapter's "at a Glance" table.
+        if self._chapter_articles:
+            entities |= self._chapter_articles.get(p.get("chapter_num"), set())
+
         return {
             "chunk_id": chunk_id,
             "text": text,
@@ -206,10 +302,7 @@ class HybridRetriever:
             "part": p.get("part"),
             "page_start": p.get("page_start"),
             "page_end": p.get("page_end"),
-            # Extract Articles from the text actually returned (parent section), not the
-            # embedded child span — the child often omits the reference that the parent
-            # carries, so the payload's child-level entities are misleadingly empty.
-            "entities": extract_entities(text),
+            "entities": sorted(entities),
             "rrf_score": round(rrf_score, 6),
         }
 
