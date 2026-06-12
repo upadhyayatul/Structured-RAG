@@ -15,6 +15,7 @@ from qdrant_client import QdrantClient
 from rank_bm25 import BM25Okapi
 
 from upsc_rag.chunking.structured import extract_entities
+from upsc_rag.observability import NOOP_CONTEXT, trace_manager
 
 _RRF_K = 60  # constant from the RRF paper (Cormack et al. 2009)
 
@@ -132,58 +133,74 @@ class HybridRetriever:
         query: str,
         top_k: int | None = None,
         rerank_top_k: int | None = None,
+        session_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Return rerank_top_k results ranked by RRF, with parent text for generation.
 
         When query rewriting is enabled, retrieves for each query variant and fuses
         all dense+BM25 rank lists together (multi-query RRF) to improve recall.
+
+        ``session_id`` (optional) groups this trace with the answer trace for the same
+        question under one Langfuse Session.
         """
         top_k = top_k if top_k is not None else self._default_top_k
         rerank_top_k = rerank_top_k if rerank_top_k is not None else self._default_rerank_top_k
 
-        # First pass: original query only (one embed). Cheap, and often enough.
-        dense_ranks, payloads, top_score = self._dense_search(query, top_k)
-        rank_lists: list[dict[str, int]] = [dense_ranks, self._bm25_search(query, top_k)]
-        qdrant_payloads: dict[str, dict] = dict(payloads)
+        with trace_manager.trace(
+            "retrieve",
+            input={"query": query, "top_k": top_k, "rerank_top_k": rerank_top_k},
+            session_id=session_id,
+        ) as trace:
 
-        # Gate: only expand with rewrite variants when the first pass looks weak.
-        # A strong top dense score means we already found the right section, so we
-        # skip the rewrite LLM call + extra embeds entirely.
-        if self._rewrite_enabled and top_score < self._rewrite_score_threshold:
-            variants = [v for v in self._expand_queries(query) if v != query]
-            if variants:
-                # Each variant needs its own OpenAI embedding round-trip; fan them
-                # out across a thread pool so the I/O-bound work overlaps.
-                with ThreadPoolExecutor(max_workers=len(variants)) as pool:
-                    for d_ranks, b_ranks, pls in pool.map(
-                        lambda q: self._search_one(q, top_k), variants
-                    ):
-                        rank_lists.append(d_ranks)
-                        rank_lists.append(b_ranks)
-                        qdrant_payloads.update(pls)
+            # First pass: original query only (one embed). Cheap, and often enough.
+            with trace.span("first_pass") as fp:
+                dense_ranks, payloads, top_score = self._dense_search(query, top_k, obs=fp)
+                rank_lists: list[dict[str, int]] = [dense_ranks, self._bm25_search(query, top_k, obs=fp)]
+                qdrant_payloads: dict[str, dict] = dict(payloads)
 
-        fused = self._rrf_fuse(rank_lists)
+            # Gate: only expand with rewrite variants when the first pass looks weak.
+            rewrite_fired = False
+            if self._rewrite_enabled and top_score < self._rewrite_score_threshold:
+                with trace.span("rewrite", input={"top_score": top_score}) as rw:
+                    variants = [v for v in self._expand_queries(query, obs=rw) if v != query]
+                if variants:
+                    rewrite_fired = True
+                    with trace.span("variant_search", input={"num_variants": len(variants)}) as vs:
+                        with ThreadPoolExecutor(max_workers=len(variants)) as pool:
+                            for d_ranks, b_ranks, pls in pool.map(
+                                lambda q: self._search_one(q, top_k, obs=vs), variants
+                            ):
+                                rank_lists.append(d_ranks)
+                                rank_lists.append(b_ranks)
+                                qdrant_payloads.update(pls)
 
-        # Graph-RAG: pull in cross-referenced sections sharing rare Articles with the
-        # top hits, fusing them into the scores so a strong signal can reach top-k.
-        if self._graph is not None:
-            self._graph_expand(fused, qdrant_payloads)
+            with trace.span("rrf_fusion", input={"num_lists": len(rank_lists)}):
+                fused = self._rrf_fuse(rank_lists)
 
-        top_ids = sorted(fused, key=lambda cid: fused[cid], reverse=True)[:rerank_top_k]
+            # Graph-RAG expansion (currently disabled via config).
+            if self._graph is not None:
+                with trace.span("graph_expand"):
+                    self._graph_expand(fused, qdrant_payloads)
 
-        return [
-            self._build_result(cid, fused[cid], qdrant_payloads)
-            for cid in top_ids
-        ]
+            top_ids = sorted(fused, key=lambda cid: fused[cid], reverse=True)[:rerank_top_k]
+            results = [self._build_result(cid, fused[cid], qdrant_payloads) for cid in top_ids]
 
-    def _expand_queries(self, query: str) -> list[str]:
+            trace.end(output={
+                "top_score": round(top_score, 4),
+                "rewrite_fired": rewrite_fired,
+                "results_returned": len(results),
+            })
+            return results
+
+    def _expand_queries(self, query: str, obs: Any = NOOP_CONTEXT) -> list[str]:
         """Return [query] or, if rewriting is enabled, the original plus LLM variants."""
         if not self._rewrite_enabled:
             return [query]
         from upsc_rag.retrieval.rewrite import rewrite_query
 
         return rewrite_query(
-            query, self._openai, model=self._rewrite_model, num_variants=self._rewrite_num_variants
+            query, self._openai, model=self._rewrite_model,
+            num_variants=self._rewrite_num_variants, obs=obs,
         )
 
     # ------------------------------------------------------------------
@@ -229,33 +246,41 @@ class HybridRetriever:
             fused[rep] = fused.get(rep, 0.0) + self._graph_rrf_weight * _rrf_score(rank)
 
     def _search_one(
-        self, query: str, top_k: int
+        self, query: str, top_k: int, obs: Any = NOOP_CONTEXT
     ) -> tuple[dict[str, int], dict[str, int], dict[str, dict]]:
         """Run dense + BM25 for a single query variant (called concurrently per variant)."""
-        dense_ranks, payloads, _ = self._dense_search(query, top_k)
-        bm25_ranks = self._bm25_search(query, top_k)
+        dense_ranks, payloads, _ = self._dense_search(query, top_k, obs=obs)
+        bm25_ranks = self._bm25_search(query, top_k, obs=obs)
         return dense_ranks, bm25_ranks, payloads
 
     def _dense_search(
-        self, query: str, top_k: int
+        self, query: str, top_k: int, obs: Any = NOOP_CONTEXT
     ) -> tuple[dict[str, int], dict[str, dict], float]:
-        query_vector = self._embed_query(query)
-        response = self._qdrant.query_points(
-            collection_name=self._collection,
-            query=query_vector,
-            limit=top_k,
-            with_payload=True,
-        )
-        hits = response.points
-        ranks = {hit.payload["chunk_id"]: rank for rank, hit in enumerate(hits)}
-        payloads = {hit.payload["chunk_id"]: hit.payload for hit in hits}
-        top_score = hits[0].score if hits else 0.0
+        # Embedding is a billable model call — trace it as a generation so Langfuse
+        # records its token usage and computes cost (like the answer generation).
+        embed = obs.generation("embed_query", model=self._embedding_model, input=query)
+        with embed:
+            query_vector, usage = self._embed_query(query)
+            embed.end(usage=usage)
+        with obs.span("qdrant_search", input={"top_k": top_k}) as s:
+            response = self._qdrant.query_points(
+                collection_name=self._collection,
+                query=query_vector,
+                limit=top_k,
+                with_payload=True,
+            )
+            hits = response.points
+            ranks = {hit.payload["chunk_id"]: rank for rank, hit in enumerate(hits)}
+            payloads = {hit.payload["chunk_id"]: hit.payload for hit in hits}
+            top_score = hits[0].score if hits else 0.0
+            s.end(output={"hits": len(hits), "top_score": round(top_score, 4)})
         return ranks, payloads, top_score
 
-    def _bm25_search(self, query: str, top_k: int) -> dict[str, int]:
-        scores = self._bm25.get_scores(tokenize(query))
-        top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k]
-        return {self._chunks[i]["id"]: rank for rank, i in enumerate(top_indices)}
+    def _bm25_search(self, query: str, top_k: int, obs: Any = NOOP_CONTEXT) -> dict[str, int]:
+        with obs.span("bm25_search", input={"top_k": top_k}):
+            scores = self._bm25.get_scores(tokenize(query))
+            top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k]
+            return {self._chunks[i]["id"]: rank for rank, i in enumerate(top_indices)}
 
     @staticmethod
     def _rrf_fuse(rank_lists: list[dict[str, int]]) -> dict[str, float]:
@@ -306,6 +331,8 @@ class HybridRetriever:
             "rrf_score": round(rrf_score, 6),
         }
 
-    def _embed_query(self, query: str) -> list[float]:
+    def _embed_query(self, query: str) -> tuple[list[float], dict[str, int]]:
+        """Return the query embedding plus token usage (for cost tracing)."""
         response = self._openai.embeddings.create(input=[query], model=self._embedding_model)
-        return response.data[0].embedding
+        usage = {"input": response.usage.prompt_tokens, "total": response.usage.total_tokens}
+        return response.data[0].embedding, usage

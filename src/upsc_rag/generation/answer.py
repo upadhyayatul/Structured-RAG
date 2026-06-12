@@ -6,6 +6,8 @@ from typing import Any, Iterator
 
 from openai import OpenAI
 
+from upsc_rag.observability import trace_manager
+
 _SYSTEM_PROMPT = (
     "You are a precise assistant for UPSC Indian Polity preparation. "
     "Answer strictly from the provided sources, cite the source numbers you "
@@ -55,6 +57,7 @@ def generate_answer(
     contexts: list[dict[str, Any]],
     cfg: dict[str, Any],
     client: OpenAI | None = None,
+    session_id: str | None = None,
 ) -> str:
     """
     Build the grounded prompt and call the LLM to produce a cited answer.
@@ -65,17 +68,38 @@ def generate_answer(
     """
     gen_cfg = cfg.get("generation", {})
     client = client or OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    model = gen_cfg.get("model", "gpt-4o-mini")
+    prompt = build_answer_prompt(query, contexts)
+    messages = [
+        {"role": "system", "content": _SYSTEM_PROMPT},
+        {"role": "user", "content": prompt},
+    ]
 
-    response = client.chat.completions.create(
-        model=gen_cfg.get("model", "gpt-4o-mini"),
-        temperature=gen_cfg.get("temperature", 0.2),
-        max_tokens=gen_cfg.get("max_tokens", 1024),
-        messages=[
-            {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user", "content": build_answer_prompt(query, contexts)},
-        ],
-    )
-    return response.choices[0].message.content or ""
+    with trace_manager.trace(
+        "answer",
+        input={"query": query, "num_sources": len(contexts)},
+        session_id=session_id,
+    ) as trace:
+        gen = trace.generation(
+            "llm",
+            model=model,
+            input=messages,
+            model_parameters={
+                "temperature": gen_cfg.get("temperature", 0.2),
+                "max_tokens": gen_cfg.get("max_tokens", 1024),
+            },
+        )
+        with gen:
+            response = client.chat.completions.create(
+                model=model,
+                temperature=gen_cfg.get("temperature", 0.2),
+                max_tokens=gen_cfg.get("max_tokens", 1024),
+                messages=messages,
+            )
+            text = response.choices[0].message.content or ""
+            gen.end(output=text, usage=_usage_dict(response.usage))
+        trace.end(output={"answer_chars": len(text)})
+        return text
 
 
 def generate_answer_stream(
@@ -83,22 +107,61 @@ def generate_answer_stream(
     contexts: list[dict[str, Any]],
     cfg: dict[str, Any],
     client: OpenAI | None = None,
+    session_id: str | None = None,
 ) -> Iterator[str]:
     """Yield the answer text incrementally as the LLM streams tokens."""
     gen_cfg = cfg.get("generation", {})
     client = client or OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    model = gen_cfg.get("model", "gpt-4o-mini")
+    messages = [
+        {"role": "system", "content": _SYSTEM_PROMPT},
+        {"role": "user", "content": build_answer_prompt(query, contexts)},
+    ]
 
-    stream = client.chat.completions.create(
-        model=gen_cfg.get("model", "gpt-4o-mini"),
-        temperature=gen_cfg.get("temperature", 0.2),
-        max_tokens=gen_cfg.get("max_tokens", 1024),
-        stream=True,
-        messages=[
-            {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user", "content": build_answer_prompt(query, contexts)},
-        ],
-    )
-    for chunk in stream:
-        delta = chunk.choices[0].delta.content if chunk.choices else None
-        if delta:
-            yield delta
+    with trace_manager.trace(
+        "answer",
+        input={"query": query, "num_sources": len(contexts)},
+        session_id=session_id,
+    ) as trace:
+        gen = trace.generation(
+            "llm",
+            model=model,
+            input=messages,
+            model_parameters={
+                "temperature": gen_cfg.get("temperature", 0.2),
+                "max_tokens": gen_cfg.get("max_tokens", 1024),
+            },
+        )
+        with gen:
+            stream = client.chat.completions.create(
+                model=model,
+                temperature=gen_cfg.get("temperature", 0.2),
+                max_tokens=gen_cfg.get("max_tokens", 1024),
+                stream=True,
+                # Ask OpenAI for a final usage chunk so we can report token counts.
+                stream_options={"include_usage": True},
+                messages=messages,
+            )
+            parts: list[str] = []
+            usage: Any = None
+            for chunk in stream:
+                if chunk.usage is not None:
+                    usage = chunk.usage
+                delta = chunk.choices[0].delta.content if chunk.choices else None
+                if delta:
+                    parts.append(delta)
+                    yield delta
+            text = "".join(parts)
+            gen.end(output=text, usage=_usage_dict(usage))
+        trace.end(output={"answer_chars": len(text)})
+
+
+def _usage_dict(usage: Any) -> dict[str, int] | None:
+    """Map an OpenAI usage object to Langfuse's token fields, or None if absent."""
+    if usage is None:
+        return None
+    return {
+        "input": usage.prompt_tokens,
+        "output": usage.completion_tokens,
+        "total": usage.total_tokens,
+    }

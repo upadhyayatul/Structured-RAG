@@ -17,13 +17,16 @@ export async function POST(req: NextRequest) {
   if (!query) {
     return NextResponse.json({ error: "query is required" }, { status: 400 });
   }
+  // Conversation id from the client; forwarded so the backend can group this
+  // question's retrieve + answer traces under one Langfuse Session.
+  const sessionId = (body as { sessionId?: string })?.sessionId;
 
   let upstream: Response;
   try {
     upstream = await fetch(`${BACKEND_URL}/ask/stream`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ query, rerank_top_k: 6 }),
+      body: JSON.stringify({ query, rerank_top_k: 6, session_id: sessionId }),
     });
   } catch {
     return NextResponse.json(

@@ -20,6 +20,8 @@ export default function Home() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [loading, setLoading] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
+  // One stable id per page load = one conversation = one Langfuse Session.
+  const sessionId = useRef<string>(crypto.randomUUID());
 
   useEffect(() => {
     document.documentElement.classList.toggle("dark", dark);
@@ -59,7 +61,7 @@ export default function Home() {
       const res = await fetch("/api/ask", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query: q }),
+        body: JSON.stringify({ query: q, sessionId: sessionId.current }),
       });
 
       if (!res.ok || !res.body) {

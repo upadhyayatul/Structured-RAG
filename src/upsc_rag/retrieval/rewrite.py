@@ -12,6 +12,8 @@ from typing import Any
 
 from openai import OpenAI
 
+from upsc_rag.observability import NOOP_CONTEXT
+
 _REWRITE_SYSTEM = (
     "You rewrite a user's question into search queries for an Indian Polity "
     "(M. Laxmikanth) textbook index. Expand abbreviations (SC -> Supreme Court, "
@@ -28,19 +30,32 @@ _REWRITE_SYSTEM = (
 _CACHE: dict[tuple[str, str, int], list[str]] = {}
 
 
-def _call_llm(query: str, client: OpenAI, model: str, num_variants: int) -> list[str]:
+def _call_llm(
+    query: str, client: OpenAI, model: str, num_variants: int, obs: Any = NOOP_CONTEXT
+) -> list[str]:
     """Ask the LLM for rephrasings; return [] on any failure (retrieval must not break)."""
+    messages = [
+        {"role": "system", "content": _REWRITE_SYSTEM},
+        {"role": "user", "content": f"Question: {query}\nGive up to {num_variants} variants."},
+    ]
+    # Billable LLM call — trace as a generation so its token usage and cost show up.
+    gen = obs.generation("rewrite_llm", model=model, input=messages,
+                         model_parameters={"temperature": 0.0})
     try:
-        resp = client.chat.completions.create(
-            model=model,
-            temperature=0.0,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": _REWRITE_SYSTEM},
-                {"role": "user", "content": f"Question: {query}\nGive up to {num_variants} variants."},
-            ],
-        )
-        data: dict[str, Any] = json.loads(resp.choices[0].message.content or "{}")
+        with gen:
+            resp = client.chat.completions.create(
+                model=model,
+                temperature=0.0,
+                response_format={"type": "json_object"},
+                messages=messages,
+            )
+            content = resp.choices[0].message.content or "{}"
+            u = resp.usage
+            gen.end(
+                output=content,
+                usage={"input": u.prompt_tokens, "output": u.completion_tokens, "total": u.total_tokens},
+            )
+        data: dict[str, Any] = json.loads(content)
         variants = data.get("queries", [])
         return [v for v in variants if isinstance(v, str) and v.strip()]
     except Exception:
@@ -52,11 +67,13 @@ def rewrite_query(
     client: OpenAI,
     model: str = "gpt-4o-mini",
     num_variants: int = 3,
+    obs: Any = NOOP_CONTEXT,
 ) -> list[str]:
     """Return the original query plus up to `num_variants` LLM rephrasings (original first, deduped)."""
     key = (query, model, num_variants)
     if key not in _CACHE:
-        _CACHE[key] = _call_llm(query, client, model, num_variants)
+        # Only a cache miss makes the (billable, traced) LLM call.
+        _CACHE[key] = _call_llm(query, client, model, num_variants, obs=obs)
 
     out = [query]
     seen = {query.strip().lower()}

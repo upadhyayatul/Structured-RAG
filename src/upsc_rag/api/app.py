@@ -62,6 +62,10 @@ class AskRequest(BaseModel):
     query: str = Field(..., min_length=1, description="Natural-language question")
     top_k: int | None = Field(default=None, description="Dense+BM25 candidate pool size")
     rerank_top_k: int | None = Field(default=None, description="Sources passed to the LLM")
+    session_id: str | None = Field(
+        default=None,
+        description="Conversation id; groups this question's traces in Langfuse Sessions",
+    )
 
 
 class Source(BaseModel):
@@ -113,9 +117,9 @@ def ask(req: AskRequest) -> AskResponse:
         raise HTTPException(status_code=503, detail="Retriever not ready")
 
     results = retriever.retrieve(
-        req.query, top_k=req.top_k, rerank_top_k=req.rerank_top_k
+        req.query, top_k=req.top_k, rerank_top_k=req.rerank_top_k, session_id=req.session_id
     )
-    answer = generate_answer(req.query, results, _state["cfg"])
+    answer = generate_answer(req.query, results, _state["cfg"], session_id=req.session_id)
     return AskResponse(answer=answer, sources=_build_sources(results))
 
 
@@ -131,13 +135,14 @@ def ask_stream(req: AskRequest) -> StreamingResponse:
         raise HTTPException(status_code=503, detail="Retriever not ready")
 
     results = retriever.retrieve(
-        req.query, top_k=req.top_k, rerank_top_k=req.rerank_top_k
+        req.query, top_k=req.top_k, rerank_top_k=req.rerank_top_k, session_id=req.session_id
     )
     sources = _build_sources(results)
 
     def event_stream() -> Iterator[str]:
         yield json.dumps({"type": "sources", "sources": [s.model_dump() for s in sources]}) + "\n"
-        for delta in generate_answer_stream(req.query, results, _state["cfg"]):
+        # generate_answer_stream traces its own LLM generation (see generation/answer.py).
+        for delta in generate_answer_stream(req.query, results, _state["cfg"], session_id=req.session_id):
             yield json.dumps({"type": "token", "text": delta}) + "\n"
         yield json.dumps({"type": "done"}) + "\n"
 

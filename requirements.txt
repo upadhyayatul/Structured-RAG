@@ -11,5 +11,7 @@ snowballstemmer>=2.2
 networkx>=3.0
 fastapi>=0.110
 uvicorn[standard]>=0.29
+pyvis>=0.3
+langfuse>=2.0,<3   # v3 dropped the .trace()/.generation() API used in observability.py
 
 # Dev (optional): pip install -r requirements-dev.txt
