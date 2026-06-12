@@ -12,6 +12,9 @@
     <marker id="arrow-amber" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
       <path d="M0,0 L0,6 L8,3 z" fill="#fbbf24"/>
     </marker>
+    <marker id="arrow-cyan" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#22d3ee"/>
+    </marker>
     <filter id="shadow" x="-5%" y="-5%" width="110%" height="110%">
       <feDropShadow dx="2" dy="2" stdDeviation="3" flood-color="#000" flood-opacity="0.4"/>
     </filter>
@@ -211,6 +214,21 @@
   <text x="997" y="591" text-anchor="middle" font-size="8" fill="#c084fc">answer generation</text>
   <line x1="880" y1="540" x2="912" y2="552" stroke="#a855f7" stroke-width="1" stroke-dasharray="3,2" marker-end="url(#arrow)"/>
 
+  <!-- Langfuse observability sink -->
+  <rect x="912" y="618" width="170" height="98" rx="8" fill="#0e2a2e" stroke="#22d3ee" stroke-width="1.5" filter="url(#shadow)"/>
+  <text x="997" y="641" text-anchor="middle" font-size="11" font-weight="700" fill="#67e8f9">Langfuse</text>
+  <text x="997" y="657" text-anchor="middle" font-size="8" fill="#22d3ee">self-hosted · port 3001</text>
+  <text x="997" y="671" text-anchor="middle" font-size="8" fill="#22d3ee">spans + generations / stage</text>
+  <text x="997" y="684" text-anchor="middle" font-size="8" fill="#22d3ee">tokens · cost · latency</text>
+  <text x="997" y="697" text-anchor="middle" font-size="8" fill="#22d3ee">sessions group a chat</text>
+  <text x="997" y="710" text-anchor="middle" font-size="7" fill="#155e63">no-op when keys unset</text>
+
+  <!-- telemetry: retriever + generation emit traces -->
+  <line x1="880" y1="660" x2="912" y2="660" stroke="#22d3ee" stroke-width="1" stroke-dasharray="3,2" marker-end="url(#arrow-cyan)"/>
+  <text x="896" y="653" text-anchor="middle" font-size="7" fill="#22d3ee">traces</text>
+  <line x1="842" y1="812" x2="958" y2="716" stroke="#22d3ee" stroke-width="1" stroke-dasharray="3,2" marker-end="url(#arrow-cyan)"/>
+  <text x="916" y="775" text-anchor="middle" font-size="7" fill="#22d3ee">answer gen</text>
+
   <!-- ════════════ LEGEND ════════════ -->
   <rect x="20" y="920" width="1080" height="40" rx="6" fill="#1e293b" stroke="#334155" stroke-width="1"/>
   <circle cx="52" cy="940" r="5" fill="#3b82f6"/>
@@ -221,7 +239,9 @@
   <text x="272" y="944" font-size="9" fill="#94a3b8">LLM-touch points</text>
   <rect x="382" y="935" width="14" height="9" rx="2" fill="#f59e0b" opacity="0.7"/>
   <text x="404" y="944" font-size="9" fill="#fcd34d">★ Catalog enrichment (new) · article_recall 50% → 75%</text>
-  <rect x="700" y="935" width="14" height="9" rx="2" fill="#374151" stroke="#334155" stroke-width="1" stroke-dasharray="3,2"/>
-  <text x="722" y="944" font-size="9" fill="#6b7280">Shelved (graph expansion)</text>
+  <rect x="640" y="935" width="14" height="9" rx="2" fill="#374151" stroke="#334155" stroke-width="1" stroke-dasharray="3,2"/>
+  <text x="662" y="944" font-size="9" fill="#6b7280">Shelved (graph expansion)</text>
+  <rect x="838" y="935" width="14" height="9" rx="2" fill="#22d3ee" opacity="0.7"/>
+  <text x="860" y="944" font-size="9" fill="#67e8f9">Telemetry → Langfuse</text>
   <text x="1075" y="944" text-anchor="end" font-size="9" fill="#475569">UPSC-RAG</text>
 </svg>
