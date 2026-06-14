@@ -185,6 +185,11 @@ class HybridRetriever:
             top_ids = sorted(fused, key=lambda cid: fused[cid], reverse=True)[:rerank_top_k]
             results = [self._build_result(cid, fused[cid], qdrant_payloads) for cid in top_ids]
 
+            # Expose the original query's top dense-cosine score on every result so
+            # callers can apply a relevance floor (off-topic gate) without re-embedding.
+            for r in results:
+                r["dense_top_score"] = round(top_score, 6)
+
             trace.end(output={
                 "top_score": round(top_score, 4),
                 "rewrite_fired": rewrite_fired,

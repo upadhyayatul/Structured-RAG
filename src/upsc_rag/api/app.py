@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field
 
 from upsc_rag.config import get_settings, load_runtime_config
 from upsc_rag.generation.answer import generate_answer, generate_answer_stream
+from upsc_rag.generation.router import OUT_OF_SCOPE_REPLY, is_off_topic, smalltalk_reply
 from upsc_rag.retrieval.hybrid import HybridRetriever
 
 # Default book served by the API; override with UPSC_RAG_BOOK env var.
@@ -116,9 +117,20 @@ def ask(req: AskRequest) -> AskResponse:
     if retriever is None:
         raise HTTPException(status_code=503, detail="Retriever not ready")
 
+    # Gate 1: pure greeting / chit-chat — reply without retrieving or generating.
+    canned = smalltalk_reply(req.query)
+    if canned is not None:
+        return AskResponse(answer=canned, sources=[])
+
     results = retriever.retrieve(
         req.query, top_k=req.top_k, rerank_top_k=req.rerank_top_k, session_id=req.session_id
     )
+
+    # Gate 2: real question, but no relevant source in the book — skip generation.
+    floor = _state["cfg"].get("retrieval", {}).get("relevance_floor", 0.0)
+    if is_off_topic(results, floor):
+        return AskResponse(answer=OUT_OF_SCOPE_REPLY, sources=[])
+
     answer = generate_answer(req.query, results, _state["cfg"], session_id=req.session_id)
     return AskResponse(answer=answer, sources=_build_sources(results))
 
@@ -134,9 +146,28 @@ def ask_stream(req: AskRequest) -> StreamingResponse:
     if retriever is None:
         raise HTTPException(status_code=503, detail="Retriever not ready")
 
+    def canned_stream(message: str) -> Iterator[str]:
+        """Emit a gated reply (smalltalk / out-of-scope) in the normal event shape."""
+        yield json.dumps({"type": "sources", "sources": []}) + "\n"
+        yield json.dumps({"type": "token", "text": message}) + "\n"
+        yield json.dumps({"type": "done"}) + "\n"
+
+    # Gate 1: pure greeting / chit-chat — reply without retrieving or generating.
+    canned = smalltalk_reply(req.query)
+    if canned is not None:
+        return StreamingResponse(canned_stream(canned), media_type="application/x-ndjson")
+
     results = retriever.retrieve(
         req.query, top_k=req.top_k, rerank_top_k=req.rerank_top_k, session_id=req.session_id
     )
+
+    # Gate 2: real question, but no relevant source in the book — skip generation.
+    floor = _state["cfg"].get("retrieval", {}).get("relevance_floor", 0.0)
+    if is_off_topic(results, floor):
+        return StreamingResponse(
+            canned_stream(OUT_OF_SCOPE_REPLY), media_type="application/x-ndjson"
+        )
+
     sources = _build_sources(results)
 
     def event_stream() -> Iterator[str]:

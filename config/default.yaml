@@ -21,6 +21,7 @@ indexing:
 retrieval:
   top_k: 30
   rerank_top_k: 8
+  relevance_floor: 0.30    # off-topic gate: if the query's top dense cosine < this, skip generation and return an out-of-scope reply (0 disables)
   rewrite:
     enabled: true          # LLM query rewriting: expand synonyms/abbreviations, multi-query retrieval
     num_variants: 3        # number of rephrasings to add alongside the original query
