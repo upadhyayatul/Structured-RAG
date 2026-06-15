@@ -63,6 +63,9 @@ class HybridRetriever:
         # top dense cosine score already clears this bar (the first pass is "good
         # enough"). Only weak first passes pay for query expansion.
         self._rewrite_score_threshold: float = rewrite_cfg.get("score_threshold", 0.5)
+        # Off-topic floor: a first pass below this is junk/out-of-scope and will be
+        # rejected by the caller's relevance gate — so don't waste a rewrite on it.
+        self._relevance_floor: float = retrieval_cfg.get("relevance_floor", 0.0)
 
         # Graph-RAG expansion: after fusion, walk the section<->article graph to pull
         # in cross-referenced sections that share rare Articles with the top hits.
@@ -158,9 +161,14 @@ class HybridRetriever:
                 rank_lists: list[dict[str, int]] = [dense_ranks, self._bm25_search(query, top_k, obs=fp)]
                 qdrant_payloads: dict[str, dict] = dict(payloads)
 
-            # Gate: only expand with rewrite variants when the first pass looks weak.
+            # Gate: expand with rewrite variants only when the first pass is weak BUT
+            # still plausibly on-topic. A score below the relevance floor is off-topic
+            # and will be rejected downstream, so skip the costly rewrite there.
             rewrite_fired = False
-            if self._rewrite_enabled and top_score < self._rewrite_score_threshold:
+            if (
+                self._rewrite_enabled
+                and self._relevance_floor <= top_score < self._rewrite_score_threshold
+            ):
                 with trace.span("rewrite", input={"top_score": top_score}) as rw:
                     variants = [v for v in self._expand_queries(query, obs=rw) if v != query]
                 if variants:

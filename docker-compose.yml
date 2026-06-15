@@ -1,12 +1,23 @@
-# Langfuse self-hosted + its Postgres dependency.
-# Qdrant is NOT included here — it's assumed to be running separately
-# (e.g. via: docker run -d --name qdrant -p 6333:6333 qdrant/qdrant)
+# Qdrant vector DB + Langfuse self-hosted (+ its Postgres dependency).
 #
 # Start:  docker-compose up -d
+# Qdrant: http://localhost:6333   (collection: upsc_polity — populate with scripts/embed.py)
 # UI:     http://localhost:3001   (sign up on first visit to create an account)
-# Stop:   docker-compose down
+# Stop:   docker-compose down      (data persists in named volumes)
 
 services:
+  qdrant-db:
+    image: qdrant/qdrant
+    container_name: qdrant-db
+    restart: unless-stopped
+    ports:
+      - "6333:6333"   # REST API (used by the app via indexing.qdrant_url)
+      - "6334:6334"   # gRPC
+    volumes:
+      # Named volume so the upsc_polity collection survives restarts/recreates.
+      - qdrant_storage:/qdrant/storage
+
+
   langfuse-db:
     image: postgres:15
     container_name: langfuse-db
@@ -54,3 +65,8 @@ services:
 
 volumes:
   langfuse_db_data:
+  # Adopt the existing, already-populated Qdrant volume (created via `docker run`)
+  # rather than letting Compose create a new prefixed one — preserves upsc_polity.
+  qdrant_storage:
+    external: true
+    name: qdrant_storage

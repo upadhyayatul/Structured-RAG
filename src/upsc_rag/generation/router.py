@@ -17,23 +17,32 @@ from typing import Any
 
 # Anchored with ^...$ so only a query that is *wholly* smalltalk matches — a real
 # question that merely contains "the"/"is"/"hi" (e.g. "What is the role of the
-# President?") will never be misrouted here. First matching pattern wins.
+# President?") will never be misrouted here. To stay robust to natural phrasing
+# ("Hi there", "how are you doing today?") each pattern allows a bounded run of
+# trailing *filler* words from a whitelist — never arbitrary content, so
+# "Hello, what is Article 14?" still falls through to the RAG path. First match wins.
+
+# Address terms / names that may trail a greeting: "hi there", "hello everyone".
+_ADDRESS = r"(?:\s*[,!.]?\s*(there|all|guys?|everyone|folks|team|bot|buddy|buddies|friends?|mate|sir|maam|ma'?am|dear))*"
+# Soft trailers after "how are you": "how are you doing today".
+_HOWRU_TAIL = r"(?:\s+(doing|today|now|then|going|so\s+far|man|bro|buddy|mate|friend))*"
+
 _SMALLTALK: list[tuple[re.Pattern[str], str]] = [
     (
-        re.compile(r"^\s*(hi+|hey+|hello+|yo|hii+|namaste|greetings)\s*[!.?]*\s*$", re.I),
+        re.compile(
+            r"^\s*(hi+|hey+|hello+|yo|hii+|heya|namaste|greetings"
+            r"|good\s+(morning|afternoon|evening|day|night))" + _ADDRESS
+            + r"\s*[!.?]*\s*$",
+            re.I,
+        ),
         "Hi! I'm your UPSC Indian Polity assistant. Ask me anything about the "
         "Constitution, Parliament, fundamental rights, the judiciary, and more.",
     ),
     (
         re.compile(
-            r"^\s*(good\s+(morning|afternoon|evening|night))\s*[!.?]*\s*$", re.I
-        ),
-        "Hello! Ready when you are — what topic in Indian Polity can I help you with?",
-    ),
-    (
-        re.compile(
-            r"^\s*(how\s+(are\s+you|are\s+u|r\s+u|do\s+you\s+do)|how'?s\s+it\s+going"
-            r"|what'?s\s+up|sup|wassup)\s*[!.?]*\s*$",
+            r"^\s*(how\s+(are\s+(you|u)|r\s+u|are\s+things|are\s+you\s+doing|do\s+you\s+do)"
+            r"|how'?s\s+it\s+going|how\s+is\s+it\s+going|what'?s\s+up|whats\s+up|sup|wassup)"
+            + _HOWRU_TAIL + r"\s*[!.?]*\s*$",
             re.I,
         ),
         "Doing well, thanks for asking! What would you like to know about Indian "
@@ -41,15 +50,17 @@ _SMALLTALK: list[tuple[re.Pattern[str], str]] = [
     ),
     (
         re.compile(
-            r"^\s*(thanks?|thank\s+you|thx|ty|much\s+appreciated|great|nice|cool|ok|okay)"
-            r"\s*[!.?]*\s*$",
+            r"^\s*(thanks?|thank\s+you|thx|ty|cheers)"
+            r"(?:\s+(a\s+lot|so\s+much|very\s+much|man|buddy|mate|friend))*"
+            r"\s*[!.?]*\s*$|^\s*(much\s+appreciated|great|nice|cool|awesome|ok|okay|kk)\s*[!.?]*\s*$",
             re.I,
         ),
         "You're welcome! Happy to help with any other polity questions.",
     ),
     (
         re.compile(
-            r"^\s*(bye|goodbye|good\s+bye|see\s+you|see\s+ya|cya|take\s+care)\s*[!.?]*\s*$",
+            r"^\s*(bye|goodbye|good\s+bye|see\s+you|see\s+ya|cya|take\s+care|catch\s+you)"
+            r"(?:\s+(now|then|soon|later|all|guys?|everyone))*\s*[!.?]*\s*$",
             re.I,
         ),
         "All the best with your preparation — come back anytime!",

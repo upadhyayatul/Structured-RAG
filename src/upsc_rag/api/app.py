@@ -147,10 +147,15 @@ def ask_stream(req: AskRequest) -> StreamingResponse:
         raise HTTPException(status_code=503, detail="Retriever not ready")
 
     def canned_stream(message: str) -> Iterator[str]:
-        """Emit a gated reply (smalltalk / out-of-scope) in the normal event shape."""
+        """Emit a gated reply (smalltalk / out-of-scope) in the normal event shape.
+
+        Gated replies make no LLM call, so cost is zero.
+        """
         yield json.dumps({"type": "sources", "sources": []}) + "\n"
         yield json.dumps({"type": "token", "text": message}) + "\n"
-        yield json.dumps({"type": "done"}) + "\n"
+        yield json.dumps(
+            {"type": "done", "cost_usd": 0.0, "input_tokens": 0, "output_tokens": 0}
+        ) + "\n"
 
     # Gate 1: pure greeting / chit-chat — reply without retrieving or generating.
     canned = smalltalk_reply(req.query)
@@ -173,8 +178,17 @@ def ask_stream(req: AskRequest) -> StreamingResponse:
     def event_stream() -> Iterator[str]:
         yield json.dumps({"type": "sources", "sources": [s.model_dump() for s in sources]}) + "\n"
         # generate_answer_stream traces its own LLM generation (see generation/answer.py).
-        for delta in generate_answer_stream(req.query, results, _state["cfg"], session_id=req.session_id):
+        # usage_sink is filled with token counts + estimated cost once the stream ends.
+        usage_sink: dict[str, Any] = {}
+        for delta in generate_answer_stream(
+            req.query, results, _state["cfg"], session_id=req.session_id, usage_sink=usage_sink
+        ):
             yield json.dumps({"type": "token", "text": delta}) + "\n"
-        yield json.dumps({"type": "done"}) + "\n"
+        yield json.dumps({
+            "type": "done",
+            "cost_usd": usage_sink.get("cost_usd", 0.0),
+            "input_tokens": usage_sink.get("input_tokens", 0),
+            "output_tokens": usage_sink.get("output_tokens", 0),
+        }) + "\n"
 
     return StreamingResponse(event_stream(), media_type="application/x-ndjson")

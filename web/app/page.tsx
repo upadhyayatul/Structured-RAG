@@ -10,6 +10,8 @@ interface ChatMessage {
   content: string;
   sources?: Source[];
   ttftMs?: number;
+  costUsd?: number;
+  totalTokens?: number;
   streaming?: boolean;
   error?: boolean;
 }
@@ -92,6 +94,14 @@ export default function Home() {
             }
             answer += evt.text;
             patchLast({ content: answer });
+          } else if (evt.type === "done") {
+            patchLast({
+              costUsd: typeof evt.cost_usd === "number" ? evt.cost_usd : undefined,
+              totalTokens:
+                typeof evt.input_tokens === "number" && typeof evt.output_tokens === "number"
+                  ? evt.input_tokens + evt.output_tokens
+                  : undefined,
+            });
           }
         }
       }
@@ -188,9 +198,25 @@ function AssistantMessage({ message }: { message: ChatMessage }) {
 
   return (
     <div className="space-y-3">
-      {message.ttftMs != null && (
-        <div className="text-xs text-neutral-400">
-          First token in {(message.ttftMs / 1000).toFixed(1)}s
+      {(message.ttftMs != null || message.costUsd != null) && (
+        <div className="flex flex-wrap gap-x-2 text-xs text-neutral-400">
+          {message.ttftMs != null && (
+            <span>First token in {(message.ttftMs / 1000).toFixed(1)}s</span>
+          )}
+          {message.costUsd != null && (
+            <>
+              <span aria-hidden>·</span>
+              <span title="Approximate answer-generation cost (OpenAI list prices)">
+                ~{formatCost(message.costUsd)}
+              </span>
+            </>
+          )}
+          {message.totalTokens != null && message.totalTokens > 0 && (
+            <>
+              <span aria-hidden>·</span>
+              <span>{message.totalTokens.toLocaleString()} tokens</span>
+            </>
+          )}
         </div>
       )}
 
@@ -227,6 +253,14 @@ function AssistantMessage({ message }: { message: ChatMessage }) {
       )}
     </div>
   );
+}
+
+// Format a tiny USD cost: cents for >= $0.01, otherwise two significant figures
+// (e.g. $0.00072) so per-question costs stay legible.
+function formatCost(usd: number): string {
+  if (usd <= 0) return "$0.00";
+  if (usd >= 0.01) return `$${usd.toFixed(2)}`;
+  return `$${usd.toPrecision(2)}`;
 }
 
 // Markdown element styling (no typography plugin needed).

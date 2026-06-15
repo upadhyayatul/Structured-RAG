@@ -8,6 +8,36 @@ from openai import OpenAI
 
 from upsc_rag.observability import trace_manager
 
+# Approx USD per 1M tokens, by model (OpenAI list prices — update if they change).
+# Used to show a rough per-answer cost in the UI; embeddings/rewrite are tiny next
+# to generation, so the displayed figure is the answer-generation cost.
+_PRICING: dict[str, dict[str, float]] = {
+    "gpt-4o-mini": {"input": 0.15, "output": 0.60},
+    "gpt-4o": {"input": 2.50, "output": 10.00},
+    "gpt-4.1-mini": {"input": 0.40, "output": 1.60},
+    "gpt-4.1-nano": {"input": 0.10, "output": 0.40},
+    "text-embedding-3-large": {"input": 0.13, "output": 0.0},
+    "text-embedding-3-small": {"input": 0.02, "output": 0.0},
+}
+
+
+def estimate_cost(model: str, input_tokens: int, output_tokens: int = 0) -> float:
+    """Approximate USD cost for a model call from its token counts (0 if unpriced)."""
+    p = _PRICING.get(model)
+    if not p:
+        return 0.0
+    return (input_tokens * p["input"] + output_tokens * p["output"]) / 1_000_000
+
+
+def _fill_usage_sink(sink: dict[str, Any] | None, model: str, usage: Any) -> None:
+    """Populate ``sink`` (if given) with token counts + estimated cost for one call."""
+    if sink is None or usage is None:
+        return
+    sink["input_tokens"] = usage.prompt_tokens
+    sink["output_tokens"] = usage.completion_tokens
+    sink["cost_usd"] = estimate_cost(model, usage.prompt_tokens, usage.completion_tokens)
+
+
 _SYSTEM_PROMPT = (
     "You are a precise assistant for UPSC Indian Polity preparation. "
     "Answer strictly from the provided sources, cite the source numbers you "
@@ -58,6 +88,7 @@ def generate_answer(
     cfg: dict[str, Any],
     client: OpenAI | None = None,
     session_id: str | None = None,
+    usage_sink: dict[str, Any] | None = None,
 ) -> str:
     """
     Build the grounded prompt and call the LLM to produce a cited answer.
@@ -98,6 +129,7 @@ def generate_answer(
             )
             text = response.choices[0].message.content or ""
             gen.end(output=text, usage=_usage_dict(response.usage))
+            _fill_usage_sink(usage_sink, model, response.usage)
         trace.end(output={"answer_chars": len(text)})
         return text
 
@@ -108,6 +140,7 @@ def generate_answer_stream(
     cfg: dict[str, Any],
     client: OpenAI | None = None,
     session_id: str | None = None,
+    usage_sink: dict[str, Any] | None = None,
 ) -> Iterator[str]:
     """Yield the answer text incrementally as the LLM streams tokens."""
     gen_cfg = cfg.get("generation", {})
@@ -153,6 +186,7 @@ def generate_answer_stream(
                     yield delta
             text = "".join(parts)
             gen.end(output=text, usage=_usage_dict(usage))
+            _fill_usage_sink(usage_sink, model, usage)
         trace.end(output={"answer_chars": len(text)})
 
 
