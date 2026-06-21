@@ -32,9 +32,9 @@ flowchart LR
 | 7. Answer | `generation/` | LLM prompt with cited sources (OpenAI) | ✅ Done |
 | 8. Serve | `api/` | FastAPI `/ask` + streaming `/ask/stream` | ✅ Done |
 | 9. UI | `web/` | Next.js streaming chat with citations | ✅ Done |
-| 10. Evaluate | — | Eval harness on UPSC past questions | ⏳ Planned |
+| 10. Evaluate | `eval/` | Retrieval-quality harness on a labeled gold set | 🟡 In progress |
 
-**Current status:** Full pipeline works end-to-end — ingest → embed → hybrid retrieve → LLM answer, exposed via FastAPI and a Next.js chat UI with token streaming. Evaluation harness is next. See `progress.json` for details.
+**Current status:** Full pipeline works end-to-end — ingest → embed → hybrid retrieve → LLM answer, exposed via FastAPI and a Next.js chat UI with token streaming. A retrieval-quality evaluation harness is in place (see [Evaluation](#evaluation)); a generation-quality (groundedness/citation) judge is the remaining gap. See `progress.json` for details.
 
 ---
 
@@ -106,7 +106,8 @@ Structured-RAG/
 │   ├── ingest.py             # Parse + chunk → chunks.jsonl
 │   ├── embed.py              # Embed children + upsert to Qdrant
 │   ├── retrieve.py           # Run a hybrid query, print ranked results
-│   └── ask.py                # Retrieve → generate → print cited answer
+│   ├── ask.py                # Retrieve → generate → print cited answer
+│   └── evaluate.py           # Score retrieval over the gold set
 │
 ├── src/upsc_rag/             # Main Python package
 │   ├── config.py             # Load YAML + .env; resolve paths
@@ -117,6 +118,7 @@ Structured-RAG/
 │   ├── retrieval/            # HybridRetriever (dense + BM25 + RRF)
 │   ├── generation/           # build_answer_prompt, generate_answer[_stream]
 │   ├── api/                  # FastAPI app (/ask, /ask/stream, /health)
+│   ├── eval/                 # retrieval-quality harness (hit@k, MRR, article_recall)
 │   └── pipeline/             # run_ingest, run_embed orchestration
 │
 ├── web/                      # Next.js 16 frontend (React 19, TS, Tailwind v4)
@@ -217,6 +219,61 @@ pytest
 
 ---
 
+## Evaluation
+
+Retrieval quality is measured against a **labeled gold set** (`data/eval/laxmikanth_6.jsonl`)
+rather than by eyeballing. Each question is labeled with the section it *should* retrieve
+(`section_contains` — substrings that must all appear in the matched `section_path`) and,
+where relevant, the governing Constitutional **Article(s)**. The harness runs the real
+`HybridRetriever` over every question and scores deterministic metrics — **no LLM judge**,
+so it's cheap, repeatable, and exactly the signal needed to tune retrieval.
+
+```powershell
+python scripts/evaluate.py --rerank 8            # run the eval
+python scripts/evaluate.py --rerank 8 --no-rewrite   # A/B a single layer
+#   flags: --no-rewrite | --no-graph | --no-catalog
+```
+
+### Metrics and what they mean
+
+| Metric | Meaning | Why it matters |
+|--------|---------|----------------|
+| **hit@k** | Fraction of questions where a relevant section appears anywhere in the top-*k* results | Is the right section retrieved *at all*? |
+| **MRR** | Mean Reciprocal Rank — average of `1/rank` of the first relevant section (rank 1 → 1.0, rank 2 → 0.5) | Is the right section ranked *high*, not just present? |
+| **article_recall** | Of questions labeled with a governing Article, the fraction whose Article appears in some result's `entities` | Is the *citable* Article surfaced for generation? |
+| **avg_articles_on_hit** | Average number of Articles attached to the gold section (lower is better) | Over-attach / citation-precision proxy — are we flooding answers with irrelevant Articles? |
+
+### The gold set
+
+30 questions, deliberately split to stress different failure modes:
+
+- **10 clean** — textbook-phrased (e.g. *"How is a judge of the Supreme Court appointed?"*).
+- **20 messy** — colloquial and abbreviation-heavy, like real aspirants ask
+  (e.g. *"ok so who actually picks SC judges, the collegium or the govt?"*, *"if an MLA jumps
+  ship to another party can he lose his seat?"*). These exercise the query-rewrite layer and
+  expose vocabulary gaps the clean set hides.
+
+### Current results
+
+30 questions, `rerank_top_k=8`, all retrieval layers on:
+
+| Metric | Result |
+|--------|--------|
+| hit@k | **93.3 %** (28/30) |
+| MRR | **0.693** |
+| article_recall | **95.5 %** (21/22) |
+| avg_articles_on_hit | **4.2** |
+
+The two remaining misses are a known catalog data gap (Article 361 immunity) and one section
+that ranks just outside the top-8. The harness is **retrieval-only**; an end-to-end
+generation-quality eval (groundedness + citation correctness) is the next addition.
+
+> The eval is also a regression gate: it surfaced — and quantified the fix for — a section
+> **alignment bug** where some chunks held the wrong section's text. Correcting it moved hit@k
+> from 76.7 % → 93.3 % and article_recall from 77.3 % → 95.5 %.
+
+---
+
 ## Design principles
 
 1. **Structure first** — Chunk inside TOC sections, not across chapter boundaries.
@@ -236,7 +293,8 @@ pytest
 - [x] `generation/` LLM integration (OpenAI, grounded + cited)
 - [x] FastAPI backend with token streaming
 - [x] Next.js streaming chat UI with markdown + citations
-- [ ] Evaluation set from chapter MCQs / past UPSC questions
+- [x] Retrieval-quality eval harness + labeled gold set (hit@k, MRR, article_recall)
+- [ ] Generation-quality eval (groundedness + citation correctness, LLM judge)
 - [ ] Reranker (cross-encoder) on top of RRF candidates
 - [ ] Multi-book support in the UI (book selector)
 ```

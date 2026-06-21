@@ -21,6 +21,7 @@ indexing:
 retrieval:
   top_k: 30
   rerank_top_k: 8
+  exclude_section_titles: []   # e.g. ["Notes and References"] to drop bibliographic sections. Left OFF: dedup already stops Notes flooding, and excluding them regresses MRR/recall on the coarse-labelled gold
   relevance_floor: 0.30    # off-topic gate: if the query's top dense cosine < this, skip generation and return an out-of-scope reply (0 disables)
   rewrite:
     enabled: true          # LLM query rewriting: expand synonyms/abbreviations, multi-query retrieval
@@ -34,6 +35,10 @@ retrieval:
     rrf_weight: 1.0        # scales the graph neighbours' RRF contribution into the fusion
   catalog:                 # attribute each chapter's 'Articles ... at a Glance' table to its sections
     enabled: true          # recovers article numbers PDF extraction stripped from the catalogs
+    match: embedding       # 'embedding' = match a section to only its governing article(s) by subject similarity; 'chapter' = legacy coarse whole-chapter union
+    score_threshold: 0.30  # min subject<->section cosine to attach an article (embedding mode)
+    max_articles: 4        # cap articles attached per section (embedding mode)
+    min_articles: 1        # always attach at least this many top-scoring articles, to protect article_recall
 
 generation:
   model: gpt-4o-mini

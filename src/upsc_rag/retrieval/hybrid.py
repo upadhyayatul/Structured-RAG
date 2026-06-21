@@ -54,6 +54,12 @@ class HybridRetriever:
         self._embedding_model: str = indexing_cfg["embedding_model"]
         self._default_top_k: int = retrieval_cfg.get("top_k", 30)
         self._default_rerank_top_k: int = retrieval_cfg.get("rerank_top_k", 8)
+        # Section titles that are bibliographic noise (citation lists), never answers —
+        # excluded from the final ranked results so they don't crowd out content sections.
+        self._exclude_section_titles: set[str] = {
+            t.strip().lower()
+            for t in retrieval_cfg.get("exclude_section_titles", ["Notes and References"])
+        }
 
         rewrite_cfg = retrieval_cfg.get("rewrite", {})
         self._rewrite_enabled: bool = bool(rewrite_cfg.get("enabled", False))
@@ -82,7 +88,14 @@ class HybridRetriever:
         # not the article number). Built below once chunks are loaded.
         catalog_cfg = retrieval_cfg.get("catalog", {})
         self._catalog_enabled: bool = bool(catalog_cfg.get("enabled", False))
-        self._chapter_articles: dict[int, set[str]] = {}
+        # 'embedding' = match each section to only its governing article(s) by
+        # subject-matter similarity; 'chapter' = legacy coarse whole-chapter union.
+        self._catalog_match: str = catalog_cfg.get("match", "embedding")
+        self._catalog_threshold: float = catalog_cfg.get("score_threshold", 0.30)
+        self._catalog_max_articles: int = catalog_cfg.get("max_articles", 4)
+        self._catalog_min_articles: int = catalog_cfg.get("min_articles", 1)
+        self._chapter_articles: dict[int, set[str]] = {}      # coarse: chapter_num -> articles
+        self._section_articles: dict[str, set[str]] = {}      # fine: parent_id -> articles
 
         self._qdrant = QdrantClient(url=indexing_cfg["qdrant_url"])
         self._openai = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
@@ -120,12 +133,83 @@ class HybridRetriever:
                 self._graph_enabled = False
 
         if self._catalog_enabled:
-            from upsc_rag.enrichment.articles_catalog import build_chapter_article_map
+            self._build_catalog_attribution(all_chunks, chunks_path)
 
+    # ------------------------------------------------------------------
+    # Catalog attribution (chapter-coarse or section-precise)
+    # ------------------------------------------------------------------
+
+    def _build_catalog_attribution(
+        self, all_chunks: list[dict[str, Any]], chunks_path: Path
+    ) -> None:
+        """Populate either the coarse chapter map or the section-precise map.
+
+        'chapter' mode attaches a chapter's whole article set to every section.
+        'embedding' mode (default) matches each section to only its governing
+        article(s) by subject similarity; the result is cached next to chunks.jsonl
+        so the one-off embedding pass runs only when chunks or params change.
+        """
+        from upsc_rag.enrichment.articles_catalog import (
+            build_chapter_article_map,
+            build_section_article_map,
+        )
+
+        if self._catalog_match == "chapter":
             self._chapter_articles = {
-                ch: set(arts)
-                for ch, arts in build_chapter_article_map(all_chunks).items()
+                ch: set(arts) for ch, arts in build_chapter_article_map(all_chunks).items()
             }
+            return
+
+        cache_path = chunks_path.parent / "section_articles.json"
+        meta = {
+            "mode": "embedding",
+            "model": self._embedding_model,
+            "threshold": self._catalog_threshold,
+            "max_articles": self._catalog_max_articles,
+            "min_articles": self._catalog_min_articles,
+            "chunks_mtime": chunks_path.stat().st_mtime,
+        }
+        cached = self._load_section_cache(cache_path, meta)
+        if cached is not None:
+            self._section_articles = cached
+            return
+
+        from upsc_rag.indexing.embedder import embed_texts
+
+        def embed_fn(texts: list[str]) -> list[list[float]]:
+            return embed_texts(texts, model=self._embedding_model, batch_size=200)
+
+        section_map = build_section_article_map(
+            all_chunks,
+            embed_fn,
+            score_threshold=self._catalog_threshold,
+            max_articles=self._catalog_max_articles,
+            min_articles=self._catalog_min_articles,
+        )
+        self._section_articles = {pid: set(arts) for pid, arts in section_map.items()}
+        self._write_section_cache(cache_path, meta, section_map)
+
+    @staticmethod
+    def _load_section_cache(
+        path: Path, meta: dict[str, Any]
+    ) -> dict[str, set[str]] | None:
+        """Return the cached section->articles map iff its meta matches, else None."""
+        if not path.exists():
+            return None
+        try:
+            blob = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return None
+        if blob.get("meta") != meta:
+            return None
+        return {pid: set(arts) for pid, arts in blob.get("map", {}).items()}
+
+    @staticmethod
+    def _write_section_cache(
+        path: Path, meta: dict[str, Any], section_map: dict[str, list[str]]
+    ) -> None:
+        payload = {"meta": meta, "map": section_map}
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     # ------------------------------------------------------------------
     # Public API
@@ -190,7 +274,24 @@ class HybridRetriever:
                 with trace.span("graph_expand"):
                     self._graph_expand(fused, qdrant_payloads)
 
-            top_ids = sorted(fused, key=lambda cid: fused[cid], reverse=True)[:rerank_top_k]
+            # Dedupe to DISTINCT parent sections: children of one section share a
+            # parent_id and otherwise flood top-k (e.g. 7 'Notes and References' child
+            # chunks crowding out the section that actually answers the query). Keep the
+            # highest-fused child per parent — the parent-text expansion returns the same
+            # section text regardless of which child won.
+            ranked = sorted(fused, key=lambda cid: fused[cid], reverse=True)
+            top_ids: list[str] = []
+            seen_parents: set[str] = set()
+            for cid in ranked:
+                if self._is_noise_section(cid, qdrant_payloads):
+                    continue
+                pid = self._parent_of(cid, qdrant_payloads) or cid
+                if pid in seen_parents:
+                    continue
+                seen_parents.add(pid)
+                top_ids.append(cid)
+                if len(top_ids) >= rerank_top_k:
+                    break
             results = [self._build_result(cid, fused[cid], qdrant_payloads) for cid in top_ids]
 
             # Expose the original query's top dense-cosine score on every result so
@@ -228,6 +329,17 @@ class HybridRetriever:
         if idx is not None:
             return self._chunks[idx].get("parent_id")
         return None
+
+    def _is_noise_section(self, chunk_id: str, qdrant_payloads: dict[str, dict]) -> bool:
+        """True if the chunk's section is a bibliographic 'Notes and References'-type section."""
+        if not self._exclude_section_titles:
+            return False
+        if chunk_id in qdrant_payloads:
+            sp = qdrant_payloads[chunk_id].get("section_path") or []
+        else:
+            idx = self._chunk_index.get(chunk_id)
+            sp = self._chunks[idx].get("section_path", []) if idx is not None else []
+        return bool(sp) and sp[-1].strip().lower() in self._exclude_section_titles
 
     def _graph_expand(self, fused: dict[str, float], qdrant_payloads: dict[str, dict]) -> None:
         """Mutate ``fused`` in place: add graph-related sections as new candidates.
@@ -326,9 +438,13 @@ class HybridRetriever:
         # Articles named in the returned text (parent section), not the embedded child
         # span — the child often omits the reference the parent carries.
         entities = set(extract_entities(text))
-        # Plus the chapter's catalog articles: Laxmikanth's prose names the topic but
-        # the article number lives only in the chapter's "at a Glance" table.
-        if self._chapter_articles:
+        # Plus the section's catalog articles: Laxmikanth's prose names the topic but
+        # the article number lives only in the chapter's "at a Glance" table. Section-
+        # precise attribution (keyed by parent_id) is preferred; the coarse chapter-wide
+        # union is the legacy fallback when catalog.match == 'chapter'.
+        if self._section_articles:
+            entities |= self._section_articles.get(p.get("parent_id"), set())
+        elif self._chapter_articles:
             entities |= self._chapter_articles.get(p.get("chapter_num"), set())
 
         return {

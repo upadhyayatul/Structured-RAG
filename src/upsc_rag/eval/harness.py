@@ -60,6 +60,7 @@ class QuestionResult:
     question: str
     rank: int | None          # 1-based rank of first relevant result, None if missed
     article_found: bool | None  # None if no articles labeled
+    articles_on_hit: int | None = None  # # articles attached to the first relevant result
 
 
 def evaluate(retriever: Any, gold: list[GoldQuestion], rerank_top_k: int | None = None) -> dict[str, Any]:
@@ -70,9 +71,11 @@ def evaluate(retriever: Any, gold: list[GoldQuestion], rerank_top_k: int | None 
         results = retriever.retrieve(g.question, rerank_top_k=rerank_top_k)
 
         rank: int | None = None
+        articles_on_hit: int | None = None
         for i, r in enumerate(results, start=1):
             if _section_relevant(r, g.section_contains):
                 rank = i
+                articles_on_hit = len(r.get("entities") or [])
                 break
 
         article_found: bool | None = None
@@ -80,7 +83,7 @@ def evaluate(retriever: Any, gold: list[GoldQuestion], rerank_top_k: int | None 
             retrieved_articles = {a for r in results for a in (r.get("entities") or [])}
             article_found = any(a in retrieved_articles for a in g.articles)
 
-        per_question.append(QuestionResult(g.question, rank, article_found))
+        per_question.append(QuestionResult(g.question, rank, article_found, articles_on_hit))
 
     n = len(per_question)
     hits = sum(1 for q in per_question if q.rank is not None)
@@ -92,10 +95,17 @@ def evaluate(retriever: Any, gold: list[GoldQuestion], rerank_top_k: int | None 
         if with_articles else None
     )
 
+    # Over-attach signal: how many articles get attached to the gold section. Coarse
+    # chapter-union attribution attaches the whole chapter (~tens); section-precise
+    # attribution should be a handful. Recall must hold while this number falls.
+    on_hit = [q.articles_on_hit for q in per_question if q.articles_on_hit is not None]
+    avg_articles_on_hit = sum(on_hit) / len(on_hit) if on_hit else None
+
     return {
         "n": n,
         "hit_at_k": hits / n if n else 0.0,
         "mrr": mrr,
         "article_recall": article_recall,
+        "avg_articles_on_hit": avg_articles_on_hit,
         "per_question": per_question,
     }

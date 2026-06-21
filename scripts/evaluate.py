@@ -48,13 +48,17 @@ def main() -> None:
     for q in report["per_question"]:
         rank = f"#{q.rank}" if q.rank else "MISS"
         art = "" if q.article_found is None else ("  art:OK" if q.article_found else "  art:miss")
-        print(f"  [{rank:>4}]{art}  {q.question}")
+        nart = f"  ({q.articles_on_hit} art)" if q.articles_on_hit is not None else ""
+        print(f"  [{rank:>4}]{art}{nart}  {q.question}")
 
     print()
     print(f"  hit@k          : {report['hit_at_k']:.2%}  ({report['n']} questions)")
     print(f"  MRR            : {report['mrr']:.3f}")
     ar = report["article_recall"]
     print(f"  article_recall : {ar:.2%}" if ar is not None else "  article_recall : n/a")
+    aah = report["avg_articles_on_hit"]
+    print(f"  avg_articles/hit: {aah:.1f}  (articles attached to the gold section — lower = less over-attach)"
+          if aah is not None else "  avg_articles/hit: n/a")
 
 
 if __name__ == "__main__":
