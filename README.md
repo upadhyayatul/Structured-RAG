@@ -28,7 +28,7 @@ flowchart LR
 | 3. Chunk | `chunking/` | Split text inside section boundaries with overlap | ✅ Done |
 | 4. Enrich | `enrichment/` | Add syllabus tags, entities, content types | ✅ Done |
 | 5. Index | `indexing/` | Save `chunks.jsonl`; embed + upsert to Qdrant | ✅ Done |
-| 6. Retrieve | `retrieval/` | Dense (Qdrant) + BM25 hybrid search, RRF fusion | ✅ Done |
+| 6. Retrieve | `retrieval/` | Dense (Qdrant) + BM25 hybrid search, RRF fusion, cross-encoder rerank | ✅ Done |
 | 7. Answer | `generation/` | LLM prompt with cited sources (OpenAI) | ✅ Done |
 | 8. Serve | `api/` | FastAPI `/ask` + streaming `/ask/stream` | ✅ Done |
 | 9. UI | `web/` | Next.js streaming chat with citations | ✅ Done |
@@ -115,7 +115,7 @@ Structured-RAG/
 │   ├── chunking/             # Hierarchy-aware splitting
 │   ├── enrichment/           # syllabus_tags, entities
 │   ├── indexing/             # JSONL store, OpenAI embedder, Qdrant store
-│   ├── retrieval/            # HybridRetriever (dense + BM25 + RRF)
+│   ├── retrieval/            # HybridRetriever (dense + BM25 + RRF), rewrite, cross-encoder rerank
 │   ├── generation/           # build_answer_prompt, generate_answer[_stream]
 │   ├── api/                  # FastAPI app (/ask, /ask/stream, /health)
 │   ├── eval/                 # retrieval-quality harness (hit@k, MRR, article_recall)
@@ -268,16 +268,53 @@ The one remaining miss is a known catalog data gap (Article 361 immunity). The h
 **retrieval-only**; an end-to-end generation-quality eval (groundedness + citation
 correctness) is the next addition.
 
-> **Cross-encoder reranker (FlashRank).** RRF fuses two *bi-encoders* (dense + BM25), which
-> encode the query and each passage separately and so struggle to separate sibling sections
-> in the same chapter — the gold section often landed at rank #2–#3. A cross-encoder
-> ([`ms-marco-MiniLM-L-12-v2`](https://huggingface.co/cross-encoder/ms-marco-MiniLM-L-12-v2)
-> via [FlashRank](https://github.com/PrithivirajDamodaran/FlashRank) — ONNX/CPU, no torch)
-> re-scores the widened deduped candidate pool by reading `(question, full section text)`
-> *jointly*. Its score is **blended** with the RRF score (`weight·rerank + (1−weight)·RRF`,
-> both min-max normalized; `weight=0.5` swept best) rather than replacing it — a pure reorder
-> (`weight=1.0`) actually regressed, demoting some correct #1s. Blended, it lifted
-> **hit@k 93.3 % → 96.7 %** and **MRR 0.693 → 0.744** with no loss in article_recall.
+### Cross-encoder reranking (FlashRank)
+
+RRF fuses two *bi-encoders* (dense + BM25), which encode the query and each passage
+*separately* and so struggle to separate sibling sections in the same chapter — the gold
+section often landed at rank #2–#3. A **cross-encoder**
+([`ms-marco-MiniLM-L-12-v2`](https://huggingface.co/cross-encoder/ms-marco-MiniLM-L-12-v2)
+via [FlashRank](https://github.com/PrithivirajDamodaran/FlashRank) — ONNX/CPU, **no torch**)
+re-scores the widened deduped candidate pool by reading `(question, full section text)`
+*jointly*, so query and passage tokens cross-attend and lookalike sections separate.
+
+**Blend, don't replace.** The cross-encoder score is min-max normalized over the pool and
+combined with the (also normalized) RRF score — it refines the fusion order instead of
+overriding it, which keeps a safety net for sections both retrievers already agreed on:
+
+```
+blend_score = weight · norm(cross_encoder) + (1 − weight) · norm(RRF)
+```
+
+Ablation on the 30-question gold set (`weight` swept; `weight=0.5` shipped):
+
+| `weight` | hit@k | MRR | note |
+|---------:|:-----:|:---:|------|
+| 0.0 | 93.3 % | 0.693 | pure RRF (rerank off) — baseline |
+| 0.3 | 93.3 % | 0.744 | |
+| **0.5** | **96.7 %** | **0.745** | **shipped** — best |
+| 0.7 | 96.7 % | 0.721 | |
+| 1.0 | 93.3 % | 0.719 | pure cross-encoder — *regresses*: demotes correct #1s, drops one section out of top-8 |
+
+Net: **hit@k 93.3 % → 96.7 %**, **MRR 0.693 → 0.744**, article_recall unchanged. Note the
+pure reorder (`weight=1.0`) is *worse* than the blend — the lesson is to fuse, not replace.
+
+**Usage.** It's on by default; tune or A/B it via config and the `--no-rerank` flag:
+
+```yaml
+# config/default.yaml → retrieval.rerank
+rerank:
+  enabled: true
+  model: ms-marco-MiniLM-L-12-v2   # FlashRank model; ~22 MB, downloaded + cached on first use
+  candidate_pool: 25               # deduped sections fed to the cross-encoder (then cut to rerank_top_k)
+  max_chars: 2000                  # section text truncated before scoring (~512-token model limit)
+  weight: 0.5                      # blend weight: 1.0 = pure rerank, 0.0 = pure RRF
+```
+
+```powershell
+python scripts/evaluate.py --rerank 8               # rerank ON (default)
+python scripts/evaluate.py --rerank 8 --no-rerank   # A/B: rerank OFF
+```
 
 > The eval is also a regression gate: it surfaced — and quantified the fix for — a section
 > **alignment bug** where some chunks held the wrong section's text. Correcting it moved hit@k
