@@ -230,8 +230,8 @@ so it's cheap, repeatable, and exactly the signal needed to tune retrieval.
 
 ```powershell
 python scripts/evaluate.py --rerank 8            # run the eval
-python scripts/evaluate.py --rerank 8 --no-rewrite   # A/B a single layer
-#   flags: --no-rewrite | --no-graph | --no-catalog
+python scripts/evaluate.py --rerank 8 --no-rerank    # A/B a single layer
+#   flags: --no-rewrite | --no-graph | --no-catalog | --no-rerank
 ```
 
 ### Metrics and what they mean
@@ -255,18 +255,29 @@ python scripts/evaluate.py --rerank 8 --no-rewrite   # A/B a single layer
 
 ### Current results
 
-30 questions, `rerank_top_k=8`, all retrieval layers on:
+30 questions, `rerank_top_k=8`, all retrieval layers on (incl. cross-encoder rerank):
 
 | Metric | Result |
 |--------|--------|
-| hit@k | **93.3 %** (28/30) |
-| MRR | **0.693** |
+| hit@k | **96.7 %** (29/30) |
+| MRR | **0.744** |
 | article_recall | **95.5 %** (21/22) |
 | avg_articles_on_hit | **4.2** |
 
-The two remaining misses are a known catalog data gap (Article 361 immunity) and one section
-that ranks just outside the top-8. The harness is **retrieval-only**; an end-to-end
-generation-quality eval (groundedness + citation correctness) is the next addition.
+The one remaining miss is a known catalog data gap (Article 361 immunity). The harness is
+**retrieval-only**; an end-to-end generation-quality eval (groundedness + citation
+correctness) is the next addition.
+
+> **Cross-encoder reranker (FlashRank).** RRF fuses two *bi-encoders* (dense + BM25), which
+> encode the query and each passage separately and so struggle to separate sibling sections
+> in the same chapter — the gold section often landed at rank #2–#3. A cross-encoder
+> ([`ms-marco-MiniLM-L-12-v2`](https://huggingface.co/cross-encoder/ms-marco-MiniLM-L-12-v2)
+> via [FlashRank](https://github.com/PrithivirajDamodaran/FlashRank) — ONNX/CPU, no torch)
+> re-scores the widened deduped candidate pool by reading `(question, full section text)`
+> *jointly*. Its score is **blended** with the RRF score (`weight·rerank + (1−weight)·RRF`,
+> both min-max normalized; `weight=0.5` swept best) rather than replacing it — a pure reorder
+> (`weight=1.0`) actually regressed, demoting some correct #1s. Blended, it lifted
+> **hit@k 93.3 % → 96.7 %** and **MRR 0.693 → 0.744** with no loss in article_recall.
 
 > The eval is also a regression gate: it surfaced — and quantified the fix for — a section
 > **alignment bug** where some chunks held the wrong section's text. Correcting it moved hit@k
@@ -294,7 +305,7 @@ generation-quality eval (groundedness + citation correctness) is the next additi
 - [x] FastAPI backend with token streaming
 - [x] Next.js streaming chat UI with markdown + citations
 - [x] Retrieval-quality eval harness + labeled gold set (hit@k, MRR, article_recall)
+- [x] Reranker (cross-encoder, FlashRank) blended with RRF candidates
 - [ ] Generation-quality eval (groundedness + citation correctness, LLM judge)
-- [ ] Reranker (cross-encoder) on top of RRF candidates
 - [ ] Multi-book support in the UI (book selector)
 ```

@@ -97,6 +97,23 @@ class HybridRetriever:
         self._chapter_articles: dict[int, set[str]] = {}      # coarse: chapter_num -> articles
         self._section_articles: dict[str, set[str]] = {}      # fine: parent_id -> articles
 
+        # Cross-encoder reranker: re-score (query, full-section-text) jointly over a
+        # widened deduped candidate pool, then truncate to rerank_top_k. Fixes the
+        # bi-encoder's sibling-section confusion (right chapter, wrong section first).
+        rerank_cfg = retrieval_cfg.get("rerank", {})
+        self._rerank_enabled: bool = bool(rerank_cfg.get("enabled", False))
+        self._rerank_model: str = rerank_cfg.get("model", "ms-marco-MiniLM-L-12-v2")
+        self._rerank_pool: int = rerank_cfg.get("candidate_pool", 25)
+        self._rerank_max_chars: int = rerank_cfg.get("max_chars", 2000)
+        self._rerank_weight: float = rerank_cfg.get("weight", 0.7)
+        self._reranker = None  # constructed lazily on first use
+        if self._rerank_enabled:
+            from upsc_rag.retrieval.rerank import CrossEncoderReranker
+
+            self._reranker = CrossEncoderReranker(
+                model_name=self._rerank_model, max_chars=self._rerank_max_chars
+            )
+
         self._qdrant = QdrantClient(url=indexing_cfg["qdrant_url"])
         self._openai = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
@@ -279,6 +296,11 @@ class HybridRetriever:
             # chunks crowding out the section that actually answers the query). Keep the
             # highest-fused child per parent — the parent-text expansion returns the same
             # section text regardless of which child won.
+            #
+            # When reranking is on we keep a WIDER deduped pool (candidate_pool) so a
+            # section RRF buried at e.g. #20 can still be promoted by the cross-encoder;
+            # otherwise we stop at rerank_top_k (RRF order is final).
+            limit = self._rerank_pool if (self._reranker is not None) else rerank_top_k
             ranked = sorted(fused, key=lambda cid: fused[cid], reverse=True)
             top_ids: list[str] = []
             seen_parents: set[str] = set()
@@ -290,9 +312,18 @@ class HybridRetriever:
                     continue
                 seen_parents.add(pid)
                 top_ids.append(cid)
-                if len(top_ids) >= rerank_top_k:
+                if len(top_ids) >= limit:
                     break
             results = [self._build_result(cid, fused[cid], qdrant_payloads) for cid in top_ids]
+
+            # Cross-encoder rerank: re-score (query, full section text) jointly and
+            # reorder, then truncate to rerank_top_k. RRF (bi-encoder) can't separate
+            # sibling sections; the cross-encoder reads both texts together and can.
+            if self._reranker is not None and results:
+                with trace.span("rerank", input={"candidates": len(results)}) as rr:
+                    results = self._rerank_results(query, results, rerank_top_k, obs=rr)
+            else:
+                results = results[:rerank_top_k]
 
             # Expose the original query's top dense-cosine score on every result so
             # callers can apply a relevance floor (off-topic gate) without re-embedding.
@@ -459,6 +490,60 @@ class HybridRetriever:
             "entities": sorted(entities),
             "rrf_score": round(rrf_score, 6),
         }
+
+    def _rerank_results(
+        self,
+        query: str,
+        results: list[dict[str, Any]],
+        rerank_top_k: int,
+        obs: Any = NOOP_CONTEXT,
+    ) -> list[dict[str, Any]]:
+        """Blend the cross-encoder score with the RRF score, reorder, truncate.
+
+        Scores each result's full section ``text`` against the query with the
+        cross-encoder, then combines it with the incoming RRF score as
+        ``weight*rerank + (1-weight)*rrf`` after min-max normalizing BOTH over the
+        candidate pool. Blending (rather than replacing the order) keeps the fusion
+        signal, so the cross-encoder refines ranking without catastrophically
+        demoting a strong RRF hit or dropping it out of top-k. Attaches
+        ``rerank_score`` and ``blend_score`` to each result; returns top
+        ``rerank_top_k``. On any reranker failure, falls back to RRF order.
+        """
+        by_id = {r["chunk_id"]: r for r in results}
+        candidates = [(r["chunk_id"], r.get("text", "")) for r in results]
+        try:
+            scored = self._reranker.rerank(query, candidates)
+        except Exception as exc:  # pragma: no cover — degrade gracefully, keep RRF order
+            obs.end(output={"error": str(exc), "fell_back": True})
+            return results[:rerank_top_k]
+
+        rerank_by_id = {cid: score for cid, score in scored}
+        rrf_by_id = {r["chunk_id"]: r.get("rrf_score", 0.0) for r in results}
+        norm_rerank = self._minmax(rerank_by_id)
+        norm_rrf = self._minmax(rrf_by_id)
+
+        w = self._rerank_weight
+        for r in results:
+            cid = r["chunk_id"]
+            r["rerank_score"] = round(float(rerank_by_id.get(cid, 0.0)), 6)
+            r["blend_score"] = round(
+                w * norm_rerank.get(cid, 0.0) + (1.0 - w) * norm_rrf.get(cid, 0.0), 6
+            )
+        reordered = sorted(results, key=lambda r: r["blend_score"], reverse=True)
+        obs.end(output={"reranked": len(reordered), "kept": min(rerank_top_k, len(reordered))})
+        return reordered[:rerank_top_k]
+
+    @staticmethod
+    def _minmax(scores: dict[str, float]) -> dict[str, float]:
+        """Min-max normalize a {id: score} map to [0, 1]; flat input maps to all 1.0."""
+        if not scores:
+            return {}
+        vals = scores.values()
+        lo, hi = min(vals), max(vals)
+        if hi <= lo:
+            return {k: 1.0 for k in scores}
+        span = hi - lo
+        return {k: (v - lo) / span for k, v in scores.items()}
 
     def _embed_query(self, query: str) -> tuple[list[float], dict[str, int]]:
         """Return the query embedding plus token usage (for cost tracing)."""
