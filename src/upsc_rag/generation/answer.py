@@ -6,11 +6,53 @@ from typing import Any, Iterator
 
 from openai import OpenAI
 
+from upsc_rag.observability import trace_manager
+
+# Approx USD per 1M tokens, by model (OpenAI list prices — update if they change).
+# Used to show a rough per-answer cost in the UI; embeddings/rewrite are tiny next
+# to generation, so the displayed figure is the answer-generation cost.
+_PRICING: dict[str, dict[str, float]] = {
+    "gpt-4o-mini": {"input": 0.15, "output": 0.60},
+    "gpt-4o": {"input": 2.50, "output": 10.00},
+    "gpt-4.1-mini": {"input": 0.40, "output": 1.60},
+    "gpt-4.1-nano": {"input": 0.10, "output": 0.40},
+    "text-embedding-3-large": {"input": 0.13, "output": 0.0},
+    "text-embedding-3-small": {"input": 0.02, "output": 0.0},
+}
+
+
+def estimate_cost(model: str, input_tokens: int, output_tokens: int = 0) -> float:
+    """Approximate USD cost for a model call from its token counts (0 if unpriced)."""
+    p = _PRICING.get(model)
+    if not p:
+        return 0.0
+    return (input_tokens * p["input"] + output_tokens * p["output"]) / 1_000_000
+
+
+def _fill_usage_sink(sink: dict[str, Any] | None, model: str, usage: Any) -> None:
+    """Populate ``sink`` (if given) with token counts + estimated cost for one call."""
+    if sink is None or usage is None:
+        return
+    sink["input_tokens"] = usage.prompt_tokens
+    sink["output_tokens"] = usage.completion_tokens
+    sink["cost_usd"] = estimate_cost(model, usage.prompt_tokens, usage.completion_tokens)
+
+
 _SYSTEM_PROMPT = (
     "You are a precise assistant for UPSC Indian Polity preparation. "
-    "Answer strictly from the provided sources, cite the source numbers you "
-    "use (e.g. [1], [3]), and never invent facts. If the sources do not "
-    "contain the answer, say so plainly."
+    "Answer strictly from the provided sources and never invent facts. If the "
+    "sources do not contain the answer, say so plainly.\n\n"
+    "CITE AS YOU WRITE — this is mandatory: every factual sentence, bullet, and "
+    "procedural step must end with the bracketed number(s) of the source(s) it "
+    "draws from, e.g. '... is appointed by the President [1].' or '... after due "
+    "inquiry [2][4].' Do not state any claim without a citation; use only the "
+    "source numbers supplied below.\n\n"
+    "State the governing Constitutional Article(s) explicitly — they are listed "
+    "with each source under 'Articles:'. Open with a one-sentence direct answer "
+    "that names the relevant Article(s) in **bold** (with its source citation). "
+    "Then use Markdown structure: short `##` headings to group ideas, bullet "
+    "points, and **bold** the key operative terms. End with notable exceptions "
+    "or conditions if the sources mention any."
 )
 
 
@@ -27,11 +69,18 @@ def build_answer_prompt(query: str, contexts: list[dict[str, Any]]) -> str:
         title = " > ".join(ctx.get("section_path") or []) or ctx.get("chapter_title", "Unknown")
         pages = ctx.get("page_start")
         cite = f"{title} (p. {pages})" if pages else title
-        blocks.append(f"[{i}] {cite}\n{ctx.get('text', '')}")
+        header = f"[{i}] {cite}"
+        ents = ", ".join(e for e in (ctx.get("entities") or []) if e)
+        if ents:
+            header += f" — Articles: {ents}"
+        blocks.append(f"{header}\n{ctx.get('text', '')}")
     context_block = "\n\n".join(blocks)
     return (
-        "Answer using only the sources below. Cite source numbers. "
-        "If the answer is not in the sources, say so.\n\n"
+        "Answer using only the sources below. End every sentence and bullet with "
+        "the bracketed number(s) of the source(s) it came from, e.g. [1] or [2][3]. "
+        "Name the relevant Constitutional Article(s) explicitly — each source "
+        "lists its Articles in the header. If the answer is not in the sources, "
+        "say so.\n\n"
         f"Question: {query}\n\n"
         f"Sources:\n{context_block}\n\n"
         "Answer:"
@@ -43,6 +92,8 @@ def generate_answer(
     contexts: list[dict[str, Any]],
     cfg: dict[str, Any],
     client: OpenAI | None = None,
+    session_id: str | None = None,
+    usage_sink: dict[str, Any] | None = None,
 ) -> str:
     """
     Build the grounded prompt and call the LLM to produce a cited answer.
@@ -53,17 +104,39 @@ def generate_answer(
     """
     gen_cfg = cfg.get("generation", {})
     client = client or OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    model = gen_cfg.get("model", "gpt-4o-mini")
+    prompt = build_answer_prompt(query, contexts)
+    messages = [
+        {"role": "system", "content": _SYSTEM_PROMPT},
+        {"role": "user", "content": prompt},
+    ]
 
-    response = client.chat.completions.create(
-        model=gen_cfg.get("model", "gpt-4o-mini"),
-        temperature=gen_cfg.get("temperature", 0.2),
-        max_tokens=gen_cfg.get("max_tokens", 1024),
-        messages=[
-            {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user", "content": build_answer_prompt(query, contexts)},
-        ],
-    )
-    return response.choices[0].message.content or ""
+    with trace_manager.trace(
+        "answer",
+        input={"query": query, "num_sources": len(contexts)},
+        session_id=session_id,
+    ) as trace:
+        gen = trace.generation(
+            "llm",
+            model=model,
+            input=messages,
+            model_parameters={
+                "temperature": gen_cfg.get("temperature", 0.2),
+                "max_tokens": gen_cfg.get("max_tokens", 1024),
+            },
+        )
+        with gen:
+            response = client.chat.completions.create(
+                model=model,
+                temperature=gen_cfg.get("temperature", 0.2),
+                max_tokens=gen_cfg.get("max_tokens", 1024),
+                messages=messages,
+            )
+            text = response.choices[0].message.content or ""
+            gen.end(output=text, usage=_usage_dict(response.usage))
+            _fill_usage_sink(usage_sink, model, response.usage)
+        trace.end(output={"answer_chars": len(text)})
+        return text
 
 
 def generate_answer_stream(
@@ -71,22 +144,63 @@ def generate_answer_stream(
     contexts: list[dict[str, Any]],
     cfg: dict[str, Any],
     client: OpenAI | None = None,
+    session_id: str | None = None,
+    usage_sink: dict[str, Any] | None = None,
 ) -> Iterator[str]:
     """Yield the answer text incrementally as the LLM streams tokens."""
     gen_cfg = cfg.get("generation", {})
     client = client or OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    model = gen_cfg.get("model", "gpt-4o-mini")
+    messages = [
+        {"role": "system", "content": _SYSTEM_PROMPT},
+        {"role": "user", "content": build_answer_prompt(query, contexts)},
+    ]
 
-    stream = client.chat.completions.create(
-        model=gen_cfg.get("model", "gpt-4o-mini"),
-        temperature=gen_cfg.get("temperature", 0.2),
-        max_tokens=gen_cfg.get("max_tokens", 1024),
-        stream=True,
-        messages=[
-            {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user", "content": build_answer_prompt(query, contexts)},
-        ],
-    )
-    for chunk in stream:
-        delta = chunk.choices[0].delta.content if chunk.choices else None
-        if delta:
-            yield delta
+    with trace_manager.trace(
+        "answer",
+        input={"query": query, "num_sources": len(contexts)},
+        session_id=session_id,
+    ) as trace:
+        gen = trace.generation(
+            "llm",
+            model=model,
+            input=messages,
+            model_parameters={
+                "temperature": gen_cfg.get("temperature", 0.2),
+                "max_tokens": gen_cfg.get("max_tokens", 1024),
+            },
+        )
+        with gen:
+            stream = client.chat.completions.create(
+                model=model,
+                temperature=gen_cfg.get("temperature", 0.2),
+                max_tokens=gen_cfg.get("max_tokens", 1024),
+                stream=True,
+                # Ask OpenAI for a final usage chunk so we can report token counts.
+                stream_options={"include_usage": True},
+                messages=messages,
+            )
+            parts: list[str] = []
+            usage: Any = None
+            for chunk in stream:
+                if chunk.usage is not None:
+                    usage = chunk.usage
+                delta = chunk.choices[0].delta.content if chunk.choices else None
+                if delta:
+                    parts.append(delta)
+                    yield delta
+            text = "".join(parts)
+            gen.end(output=text, usage=_usage_dict(usage))
+            _fill_usage_sink(usage_sink, model, usage)
+        trace.end(output={"answer_chars": len(text)})
+
+
+def _usage_dict(usage: Any) -> dict[str, int] | None:
+    """Map an OpenAI usage object to Langfuse's token fields, or None if absent."""
+    if usage is None:
+        return None
+    return {
+        "input": usage.prompt_tokens,
+        "output": usage.completion_tokens,
+        "total": usage.total_tokens,
+    }

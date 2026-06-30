@@ -8,7 +8,11 @@ openai>=1.30
 qdrant-client>=1.9
 rank-bm25>=0.2
 snowballstemmer>=2.2
+flashrank>=0.2   # cross-encoder reranker (ONNX, CPU, no torch) — retrieval.rerank
+networkx>=3.0
 fastapi>=0.110
 uvicorn[standard]>=0.29
+pyvis>=0.3
+langfuse>=2.0,<3   # v3 dropped the .trace()/.generation() API used in observability.py
 
 # Dev (optional): pip install -r requirements-dev.txt

@@ -38,8 +38,14 @@ _ARTICLE_RE = re.compile(r"\bArticle\s+\d+[A-Z]?\b", re.I)
 
 
 def extract_entities(text: str) -> list[str]:
-    """Return a sorted, deduplicated list of 'Article NNN' references found in text."""
-    return sorted({m.group(0) for m in _ARTICLE_RE.finditer(text)})
+    """Return a sorted, deduplicated list of 'Article NNN' references found in text.
+
+    Internal whitespace is normalized to a single space so PDF line breaks
+    ('Article\\n312') collapse to the canonical 'Article 312' — otherwise the same
+    reference fails to match across chunks, the gold set, and graph nodes.
+    """
+    refs = {re.sub(r"\s+", " ", m.group(0)) for m in _ARTICLE_RE.finditer(text)}
+    return sorted(refs)
 
 
 def _token_estimate(text: str) -> int:

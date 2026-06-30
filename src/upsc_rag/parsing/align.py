@@ -11,57 +11,152 @@ from upsc_rag.parsing.pdf import iter_pages
 
 
 def _normalize(text: str) -> str:
-    """Collapse whitespace and lowercase for fuzzy heading comparison."""
-    return re.sub(r'\s+', ' ', text).strip().lower()
+    """Lowercase and map every non-alphanumeric run to a single space.
+
+    Robust to the punctuation/encoding differences between TOC titles and body
+    headings (curly apostrophes, em/en dashes, trailing periods on roman numerals),
+    which an earlier whitespace-only normaliser tripped over.
+    """
+    return re.sub(r'[^a-z0-9]+', ' ', text.lower()).strip()
+
+
+def _caps_headings(page_text: str) -> list[str]:
+    """Normalised text of each ALL-CAPS heading line on a page.
+
+    Laxmikanth renders section headings in full caps (PROCEDURE FOR AMENDMENT),
+    which is a far stronger anchor than 'title appears somewhere on the page' — the
+    latter matches stray mentions and desyncs the whole forward scan.
+    """
+    out: list[str] = []
+    for ln in page_text.splitlines():
+        ls = ln.strip()
+        if len(ls) >= 3 and ls.isupper() and any(c.isalpha() for c in ls):
+            out.append(_normalize(ls))
+    return out
 
 
 def align_toc_with_body(
     doc: fitz.Document,
     toc_nodes: list[TocNode],
     start_page: int,
-    end_page: int
+    end_page: int,
 ) -> None:
+    """Assign ``page_start`` to every chapter (L2) and section (L3) TOC node.
+
+    Two anchored, document-order passes (monotonic, so the same heading text in two
+    chapters — e.g. 'Composition and Appointment' in both Supreme Court and High
+    Court — resolves to the correct occurrence):
+
+      A. Chapters: match the chapter title (sans leading number) as a standalone body
+         line. This yields per-chapter page windows that bound section search and
+         prevent a missing/odd section heading from overshooting into a later chapter.
+      B. Sections: within each chapter window, match the section's ALL-CAPS heading
+         line; sections whose heading wraps/differs fall back to a substring search
+         *inside the window only* (safe — can't cross a chapter boundary).
+
+    Modifies ``toc_nodes`` in place.
     """
-    Finds the start page for each TOC node by searching the PDF body text.
-    Modifies toc_nodes in-place.
-    """
-    flat_nodes: list[TocNode] = []
+    flat: list[TocNode] = []
 
     def _flatten(nodes: list[TocNode]) -> None:
         for n in nodes:
-            flat_nodes.append(n)
+            flat.append(n)
             _flatten(n.children)
 
     _flatten(toc_nodes)
 
-    node_idx = 0
-    total_nodes = len(flat_nodes)
-
+    # Precompute body page text and caps headings once (1-based page numbers).
+    page_text: dict[int, str] = {}
+    page_caps: dict[int, list[str]] = {}
+    page_raw: dict[int, list[str]] = {}
     for page_num, text in iter_pages(doc, start=start_page, end=end_page):
-        if node_idx >= total_nodes:
-            break
+        page_text[page_num] = text
+        page_caps[page_num] = _caps_headings(text)
+        page_raw[page_num] = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    pages = sorted(page_text)
 
-        norm_text = _normalize(text)
+    chapters = [n for n in flat if n.level == 2]
 
-        while node_idx < total_nodes:
-            found_ahead = -1
-            # Look ahead up to 5 nodes to recover from slight text mismatches
-            for offset in range(min(5, total_nodes - node_idx)):
-                node = flat_nodes[node_idx + offset]
-                norm_title = _normalize(node.title)
+    # A chapter heading equals the chapter title, optionally followed by a parenthetical
+    # subtitle ('NITI Aayog (National Institution for Transforming India)') and possibly
+    # WRAPPED across up to 3 physical lines ('Special Officer for Linguistic' / 'Minorities').
+    # We join 1–3 consecutive lines, strip a trailing (...), and require EQUALITY — precise
+    # enough that it never matches a sentence merely starting with a short title ('President'),
+    # and finding the wrapped heading at its real page prevents a stray later mention from
+    # mis-anchoring the chapter and cascading the monotonic scan.
+    _paren = re.compile(r'\s*\([^)]*\)\s*$')
 
-                if norm_title in norm_text:
-                    found_ahead = offset
+    def _page_has_heading(raw_lines: list[str], title: str) -> bool:
+        for i in range(len(raw_lines)):
+            for k in (1, 2, 3):
+                if i + k > len(raw_lines):
+                    break
+                joined = " ".join(raw_lines[i:i + k])
+                if _normalize(_paren.sub('', joined)) == title:
+                    return True
+        return False
+
+    # --- Pass A: anchor chapters by their (number-stripped) title as a body heading ---
+    cur = start_page
+    for ch in chapters:
+        title = _normalize(re.sub(r'^\d+\s+', '', ch.title))
+        if len(title) < 4:
+            continue
+        for p in pages:
+            if p < cur:
+                continue
+            if _page_has_heading(page_raw[p], title):
+                ch.page_start = p
+                cur = p
+                break
+
+    # --- Pass B: anchor each chapter's sections within its page window ---
+    for ci, ch in enumerate(chapters):
+        if ch.page_start is None:
+            continue
+        win_start = ch.page_start
+        win_end = end_page
+        for nxt in chapters[ci + 1:]:
+            if nxt.page_start is not None:
+                win_end = nxt.page_start - 1
+                break
+
+        sections = [c for c in ch.children if c.level == 3]
+
+        # B1: monotonic caps-heading match inside the window.
+        cur = win_start
+        for sec in sections:
+            nt = _normalize(sec.title)
+            if not nt:
+                continue
+            for p in range(cur, win_end + 1):
+                caps = page_caps.get(p, [])
+                if nt in caps or (len(caps) >= 2 and nt in _normalize(" ".join(caps))):
+                    sec.page_start = p
+                    cur = p
                     break
 
-            if found_ahead != -1:
-                # Found a node on this page; assign skipped nodes to this page as fallback.
-                for i in range(found_ahead + 1):
-                    if flat_nodes[node_idx + i].page_start is None:
-                        flat_nodes[node_idx + i].page_start = page_num
-                node_idx += found_ahead + 1
-            else:
-                break
+        # B2: windowed substring fallback for sections whose heading didn't match
+        # (long headings that wrap across lines, or TOC titles split mid-phrase).
+        for si, sec in enumerate(sections):
+            if sec.page_start is not None:
+                continue
+            lo = win_start
+            for j in range(si - 1, -1, -1):
+                if sections[j].page_start is not None:
+                    lo = sections[j].page_start
+                    break
+            hi = win_end
+            for j in range(si + 1, len(sections)):
+                if sections[j].page_start is not None:
+                    hi = sections[j].page_start
+                    break
+            nt = _normalize(sec.title)
+            sec.page_start = lo  # safe default: stays within the chapter window
+            for p in range(lo, hi + 1):
+                if nt and nt in _normalize(page_text.get(p, "")):
+                    sec.page_start = p
+                    break
 
 
 def fill_page_end(

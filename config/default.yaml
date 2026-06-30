@@ -21,8 +21,38 @@ indexing:
 retrieval:
   top_k: 30
   rerank_top_k: 8
+  exclude_section_titles: []   # e.g. ["Notes and References"] to drop bibliographic sections. Left OFF: dedup already stops Notes flooding, and excluding them regresses MRR/recall on the coarse-labelled gold
+  relevance_floor: 0.30    # off-topic gate: if the query's top dense cosine < this, skip generation and return an out-of-scope reply (0 disables)
+  rewrite:
+    enabled: true          # LLM query rewriting: expand synonyms/abbreviations, multi-query retrieval
+    num_variants: 3        # number of rephrasings to add alongside the original query
+    model: gpt-4.1-nano
+    score_threshold: 0.55  # gate: skip rewrite when original query's top dense cosine >= this (first pass already good)
+  graph:                   # Graph-RAG expansion: surface cross-referenced sections via shared Articles
+    enabled: false         # no-op on this corpus (article numbers absent from prose sections); see progress.json
+    seed_sections: 5       # use the top-N fused sections as expansion seeds
+    max_neighbors: 3       # add at most this many graph-related sections per query
+    rrf_weight: 1.0        # scales the graph neighbours' RRF contribution into the fusion
+  catalog:                 # attribute each chapter's 'Articles ... at a Glance' table to its sections
+    enabled: true          # recovers article numbers PDF extraction stripped from the catalogs
+    match: embedding       # 'embedding' = match a section to only its governing article(s) by subject similarity; 'chapter' = legacy coarse whole-chapter union
+    score_threshold: 0.30  # min subject<->section cosine to attach an article (embedding mode)
+    max_articles: 4        # cap articles attached per section (embedding mode)
+    min_articles: 1        # always attach at least this many top-scoring articles, to protect article_recall
+  rerank:                  # cross-encoder reranker over the deduped candidate sections (FlashRank, ONNX/CPU, no torch)
+    enabled: true          # re-score (query, full-section-text) jointly to promote the right section above its lookalike siblings; bi-encoder RRF can't separate them
+    model: ms-marco-MiniLM-L-12-v2  # FlashRank model name; downloaded + cached on first use (~22MB)
+    candidate_pool: 25     # how many deduped sections to feed the cross-encoder before truncating to rerank_top_k (wider than rerank_top_k=8 so a #20 RRF section can win)
+    max_chars: 2000        # cap section text length sent to the cross-encoder (input is truncated to ~512 tokens anyway; keeps latency flat)
+    weight: 0.5            # final = weight*rerank + (1-weight)*RRF (both min-max normalized over the pool). Blend, don't replace: a pure cross-encoder reorder (1.0) demotes some correct RRF #1s and drops sections out of top-k. 0.5 swept best on the gold set (hit@k 93.3->96.7%, MRR 0.693->0.745); 1.0 = pure rerank, 0.0 = pure RRF
 
 generation:
   model: gpt-4o-mini
   temperature: 0.2
   max_tokens: 1024
+
+eval:
+  generation:               # cheap generation-quality signals (scripts/evaluate_generation.py) — no LLM judge
+    embed_model: text-embedding-3-small  # embedder for groundedness + answer-relevance cosines (cheap; separate from the 3-large corpus model)
+    ground_threshold: 0.65  # min cosine(answer-sentence, best source SENTENCE-window) to count a sentence as 'supported'. Raised 0.5->0.65 once groundedness matched sentence windows (not whole sections): window-matching lifts the support floor (mean ~0.76), so 0.5 saturated at ~99% and lost discriminative power
+

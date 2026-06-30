@@ -8,6 +8,7 @@ load_dotenv()
 
 from upsc_rag.config import get_settings, load_runtime_config
 from upsc_rag.generation.answer import generate_answer
+from upsc_rag.generation.router import OUT_OF_SCOPE_REPLY, is_off_topic, smalltalk_reply
 from upsc_rag.retrieval.hybrid import HybridRetriever
 
 
@@ -28,7 +29,23 @@ def main() -> None:
     retriever = HybridRetriever(cfg, chunks_path)
 
     print(f"\nQuery: {args.query!r}\n")
+    # Gate 1: pure greeting / chit-chat — reply without retrieving or generating.
+    canned = smalltalk_reply(args.query)
+    if canned is not None:
+        print("=" * 70)
+        print(canned)
+        print("=" * 70)
+        return
+
     results = retriever.retrieve(args.query, top_k=args.top_k, rerank_top_k=args.rerank)
+
+    # Gate 2: real question, but no relevant source in the book — skip generation.
+    floor = cfg.get("retrieval", {}).get("relevance_floor", 0.0)
+    if is_off_topic(results, floor):
+        print("=" * 70)
+        print(OUT_OF_SCOPE_REPLY)
+        print("=" * 70)
+        return
 
     print("Generating answer…\n")
     answer = generate_answer(args.query, results, cfg)

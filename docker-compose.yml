@@ -1,0 +1,72 @@
+# Qdrant vector DB + Langfuse self-hosted (+ its Postgres dependency).
+#
+# Start:  docker-compose up -d
+# Qdrant: http://localhost:6333   (collection: upsc_polity — populate with scripts/embed.py)
+# UI:     http://localhost:3001   (sign up on first visit to create an account)
+# Stop:   docker-compose down      (data persists in named volumes)
+
+services:
+  qdrant-db:
+    image: qdrant/qdrant
+    container_name: qdrant-db
+    restart: unless-stopped
+    ports:
+      - "6333:6333"   # REST API (used by the app via indexing.qdrant_url)
+      - "6334:6334"   # gRPC
+    volumes:
+      # Named volume so the upsc_polity collection survives restarts/recreates.
+      - qdrant_storage:/qdrant/storage
+
+
+  langfuse-db:
+    image: postgres:15
+    container_name: langfuse-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: langfuse
+      POSTGRES_PASSWORD: langfuse
+      POSTGRES_DB: langfuse
+    volumes:
+      - langfuse_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U langfuse"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  langfuse:
+    # Pin to v2: it runs on Postgres alone. v3+ (":latest") additionally requires
+    # ClickHouse + Redis + S3, and only the v2 server speaks the v2 SDK's API.
+    image: langfuse/langfuse:2
+    container_name: langfuse
+    restart: unless-stopped
+    depends_on:
+      langfuse-db:
+        condition: service_healthy
+    ports:
+      - "3001:3000"
+    environment:
+      DATABASE_URL: postgresql://langfuse:langfuse@langfuse-db:5432/langfuse
+      NEXTAUTH_SECRET: "upsc-rag-local-secret-change-in-prod"
+      NEXTAUTH_URL: "http://localhost:3001"
+      SALT: "upsc-rag-local-salt"
+      TELEMETRY_ENABLED: "false"
+      LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES: "false"
+      # Headless bootstrap: provisions an org/project/user + fixed API keys on first
+      # start, so no UI signup is needed. Put these same keys in .env for the app:
+      #   LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY / LANGFUSE_HOST=http://localhost:3001
+      LANGFUSE_INIT_ORG_ID: "upsc-rag"
+      LANGFUSE_INIT_PROJECT_ID: "upsc-polity"
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: "pk-lf-upsc-rag-local"
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: "sk-lf-upsc-rag-local"
+      LANGFUSE_INIT_USER_EMAIL: "dev@example.com"
+      LANGFUSE_INIT_USER_NAME: "dev"
+      LANGFUSE_INIT_USER_PASSWORD: "localdevpassword"
+
+volumes:
+  langfuse_db_data:
+  # Adopt the existing, already-populated Qdrant volume (created via `docker run`)
+  # rather than letting Compose create a new prefixed one — preserves upsc_polity.
+  qdrant_storage:
+    external: true
+    name: qdrant_storage

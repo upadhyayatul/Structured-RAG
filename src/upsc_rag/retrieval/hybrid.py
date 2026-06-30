@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 import os
 import re
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -11,6 +13,9 @@ import snowballstemmer
 from openai import OpenAI
 from qdrant_client import QdrantClient
 from rank_bm25 import BM25Okapi
+
+from upsc_rag.chunking.structured import extract_entities
+from upsc_rag.observability import NOOP_CONTEXT, trace_manager
 
 _RRF_K = 60  # constant from the RRF paper (Cormack et al. 2009)
 
@@ -49,6 +54,65 @@ class HybridRetriever:
         self._embedding_model: str = indexing_cfg["embedding_model"]
         self._default_top_k: int = retrieval_cfg.get("top_k", 30)
         self._default_rerank_top_k: int = retrieval_cfg.get("rerank_top_k", 8)
+        # Section titles that are bibliographic noise (citation lists), never answers —
+        # excluded from the final ranked results so they don't crowd out content sections.
+        self._exclude_section_titles: set[str] = {
+            t.strip().lower()
+            for t in retrieval_cfg.get("exclude_section_titles", ["Notes and References"])
+        }
+
+        rewrite_cfg = retrieval_cfg.get("rewrite", {})
+        self._rewrite_enabled: bool = bool(rewrite_cfg.get("enabled", False))
+        self._rewrite_num_variants: int = rewrite_cfg.get("num_variants", 3)
+        self._rewrite_model: str = rewrite_cfg.get("model", "gpt-4o-mini")
+        # Gate: skip the rewrite LLM call + variant embeds when the original query's
+        # top dense cosine score already clears this bar (the first pass is "good
+        # enough"). Only weak first passes pay for query expansion.
+        self._rewrite_score_threshold: float = rewrite_cfg.get("score_threshold", 0.5)
+        # Off-topic floor: a first pass below this is junk/out-of-scope and will be
+        # rejected by the caller's relevance gate — so don't waste a rewrite on it.
+        self._relevance_floor: float = retrieval_cfg.get("relevance_floor", 0.0)
+
+        # Graph-RAG expansion: after fusion, walk the section<->article graph to pull
+        # in cross-referenced sections that share rare Articles with the top hits.
+        graph_cfg = retrieval_cfg.get("graph", {})
+        self._graph_enabled: bool = bool(graph_cfg.get("enabled", False))
+        self._graph_seed_sections: int = graph_cfg.get("seed_sections", 5)
+        self._graph_max_neighbors: int = graph_cfg.get("max_neighbors", 3)
+        self._graph_rrf_weight: float = graph_cfg.get("rrf_weight", 1.0)
+        self._graph = None
+
+        # Chapter-level article catalog: maps chapter_num -> {"Article 124", ...} parsed
+        # from each chapter's "Articles ... at a Glance" table. Used to attribute a
+        # chapter's governing articles to its sections (whose prose names the topic but
+        # not the article number). Built below once chunks are loaded.
+        catalog_cfg = retrieval_cfg.get("catalog", {})
+        self._catalog_enabled: bool = bool(catalog_cfg.get("enabled", False))
+        # 'embedding' = match each section to only its governing article(s) by
+        # subject-matter similarity; 'chapter' = legacy coarse whole-chapter union.
+        self._catalog_match: str = catalog_cfg.get("match", "embedding")
+        self._catalog_threshold: float = catalog_cfg.get("score_threshold", 0.30)
+        self._catalog_max_articles: int = catalog_cfg.get("max_articles", 4)
+        self._catalog_min_articles: int = catalog_cfg.get("min_articles", 1)
+        self._chapter_articles: dict[int, set[str]] = {}      # coarse: chapter_num -> articles
+        self._section_articles: dict[str, set[str]] = {}      # fine: parent_id -> articles
+
+        # Cross-encoder reranker: re-score (query, full-section-text) jointly over a
+        # widened deduped candidate pool, then truncate to rerank_top_k. Fixes the
+        # bi-encoder's sibling-section confusion (right chapter, wrong section first).
+        rerank_cfg = retrieval_cfg.get("rerank", {})
+        self._rerank_enabled: bool = bool(rerank_cfg.get("enabled", False))
+        self._rerank_model: str = rerank_cfg.get("model", "ms-marco-MiniLM-L-12-v2")
+        self._rerank_pool: int = rerank_cfg.get("candidate_pool", 25)
+        self._rerank_max_chars: int = rerank_cfg.get("max_chars", 2000)
+        self._rerank_weight: float = rerank_cfg.get("weight", 0.7)
+        self._reranker = None  # constructed lazily on first use
+        if self._rerank_enabled:
+            from upsc_rag.retrieval.rerank import CrossEncoderReranker
+
+            self._reranker = CrossEncoderReranker(
+                model_name=self._rerank_model, max_chars=self._rerank_max_chars
+            )
 
         self._qdrant = QdrantClient(url=indexing_cfg["qdrant_url"])
         self._openai = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
@@ -67,6 +131,103 @@ class HybridRetriever:
         # Fast lookup: chunk id → index in self._chunks
         self._chunk_index: dict[str, int] = {c["id"]: i for i, c in enumerate(self._chunks)}
 
+        # Map each parent section id → its child chunk ids, so a graph-expanded
+        # section can be represented in the fused candidate pool by a real child.
+        self._section_children: dict[str, list[str]] = defaultdict(list)
+        for c in self._chunks:
+            pid = c.get("parent_id")
+            if pid:
+                self._section_children[pid].append(c["id"])
+
+        if self._graph_enabled:
+            from upsc_rag.indexing.graph_store import load_graph
+
+            graph_path = chunks_path.parent / "graph.pkl"
+            if graph_path.exists():
+                self._graph = load_graph(graph_path)
+            else:
+                # Graph not built for this book — disable rather than fail.
+                self._graph_enabled = False
+
+        if self._catalog_enabled:
+            self._build_catalog_attribution(all_chunks, chunks_path)
+
+    # ------------------------------------------------------------------
+    # Catalog attribution (chapter-coarse or section-precise)
+    # ------------------------------------------------------------------
+
+    def _build_catalog_attribution(
+        self, all_chunks: list[dict[str, Any]], chunks_path: Path
+    ) -> None:
+        """Populate either the coarse chapter map or the section-precise map.
+
+        'chapter' mode attaches a chapter's whole article set to every section.
+        'embedding' mode (default) matches each section to only its governing
+        article(s) by subject similarity; the result is cached next to chunks.jsonl
+        so the one-off embedding pass runs only when chunks or params change.
+        """
+        from upsc_rag.enrichment.articles_catalog import (
+            build_chapter_article_map,
+            build_section_article_map,
+        )
+
+        if self._catalog_match == "chapter":
+            self._chapter_articles = {
+                ch: set(arts) for ch, arts in build_chapter_article_map(all_chunks).items()
+            }
+            return
+
+        cache_path = chunks_path.parent / "section_articles.json"
+        meta = {
+            "mode": "embedding",
+            "model": self._embedding_model,
+            "threshold": self._catalog_threshold,
+            "max_articles": self._catalog_max_articles,
+            "min_articles": self._catalog_min_articles,
+            "chunks_mtime": chunks_path.stat().st_mtime,
+        }
+        cached = self._load_section_cache(cache_path, meta)
+        if cached is not None:
+            self._section_articles = cached
+            return
+
+        from upsc_rag.indexing.embedder import embed_texts
+
+        def embed_fn(texts: list[str]) -> list[list[float]]:
+            return embed_texts(texts, model=self._embedding_model, batch_size=200)
+
+        section_map = build_section_article_map(
+            all_chunks,
+            embed_fn,
+            score_threshold=self._catalog_threshold,
+            max_articles=self._catalog_max_articles,
+            min_articles=self._catalog_min_articles,
+        )
+        self._section_articles = {pid: set(arts) for pid, arts in section_map.items()}
+        self._write_section_cache(cache_path, meta, section_map)
+
+    @staticmethod
+    def _load_section_cache(
+        path: Path, meta: dict[str, Any]
+    ) -> dict[str, set[str]] | None:
+        """Return the cached section->articles map iff its meta matches, else None."""
+        if not path.exists():
+            return None
+        try:
+            blob = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return None
+        if blob.get("meta") != meta:
+            return None
+        return {pid: set(arts) for pid, arts in blob.get("map", {}).items()}
+
+    @staticmethod
+    def _write_section_cache(
+        path: Path, meta: dict[str, Any], section_map: dict[str, list[str]]
+    ) -> None:
+        payload = {"meta": meta, "map": section_map}
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -76,59 +237,214 @@ class HybridRetriever:
         query: str,
         top_k: int | None = None,
         rerank_top_k: int | None = None,
+        session_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Return rerank_top_k results ranked by RRF, with parent text for generation."""
+        """Return rerank_top_k results ranked by RRF, with parent text for generation.
+
+        When query rewriting is enabled, retrieves for each query variant and fuses
+        all dense+BM25 rank lists together (multi-query RRF) to improve recall.
+
+        ``session_id`` (optional) groups this trace with the answer trace for the same
+        question under one Langfuse Session.
+        """
         top_k = top_k if top_k is not None else self._default_top_k
         rerank_top_k = rerank_top_k if rerank_top_k is not None else self._default_rerank_top_k
 
-        dense_ranks, qdrant_payloads = self._dense_search(query, top_k)
-        bm25_ranks = self._bm25_search(query, top_k)
+        with trace_manager.trace(
+            "retrieve",
+            input={"query": query, "top_k": top_k, "rerank_top_k": rerank_top_k},
+            session_id=session_id,
+        ) as trace:
 
-        fused = self._rrf_fuse(dense_ranks, bm25_ranks)
-        top_ids = sorted(fused, key=lambda cid: fused[cid], reverse=True)[:rerank_top_k]
+            # First pass: original query only (one embed). Cheap, and often enough.
+            with trace.span("first_pass") as fp:
+                dense_ranks, payloads, top_score = self._dense_search(query, top_k, obs=fp)
+                rank_lists: list[dict[str, int]] = [dense_ranks, self._bm25_search(query, top_k, obs=fp)]
+                qdrant_payloads: dict[str, dict] = dict(payloads)
 
-        return [
-            self._build_result(cid, fused[cid], qdrant_payloads)
-            for cid in top_ids
-        ]
+            # Gate: expand with rewrite variants only when the first pass is weak BUT
+            # still plausibly on-topic. A score below the relevance floor is off-topic
+            # and will be rejected downstream, so skip the costly rewrite there.
+            rewrite_fired = False
+            if (
+                self._rewrite_enabled
+                and self._relevance_floor <= top_score < self._rewrite_score_threshold
+            ):
+                with trace.span("rewrite", input={"top_score": top_score}) as rw:
+                    variants = [v for v in self._expand_queries(query, obs=rw) if v != query]
+                if variants:
+                    rewrite_fired = True
+                    with trace.span("variant_search", input={"num_variants": len(variants)}) as vs:
+                        with ThreadPoolExecutor(max_workers=len(variants)) as pool:
+                            for d_ranks, b_ranks, pls in pool.map(
+                                lambda q: self._search_one(q, top_k, obs=vs), variants
+                            ):
+                                rank_lists.append(d_ranks)
+                                rank_lists.append(b_ranks)
+                                qdrant_payloads.update(pls)
+
+            with trace.span("rrf_fusion", input={"num_lists": len(rank_lists)}):
+                fused = self._rrf_fuse(rank_lists)
+
+            # Graph-RAG expansion (currently disabled via config).
+            if self._graph is not None:
+                with trace.span("graph_expand"):
+                    self._graph_expand(fused, qdrant_payloads)
+
+            # Dedupe to DISTINCT parent sections: children of one section share a
+            # parent_id and otherwise flood top-k (e.g. 7 'Notes and References' child
+            # chunks crowding out the section that actually answers the query). Keep the
+            # highest-fused child per parent — the parent-text expansion returns the same
+            # section text regardless of which child won.
+            #
+            # When reranking is on we keep a WIDER deduped pool (candidate_pool) so a
+            # section RRF buried at e.g. #20 can still be promoted by the cross-encoder;
+            # otherwise we stop at rerank_top_k (RRF order is final).
+            limit = self._rerank_pool if (self._reranker is not None) else rerank_top_k
+            ranked = sorted(fused, key=lambda cid: fused[cid], reverse=True)
+            top_ids: list[str] = []
+            seen_parents: set[str] = set()
+            for cid in ranked:
+                if self._is_noise_section(cid, qdrant_payloads):
+                    continue
+                pid = self._parent_of(cid, qdrant_payloads) or cid
+                if pid in seen_parents:
+                    continue
+                seen_parents.add(pid)
+                top_ids.append(cid)
+                if len(top_ids) >= limit:
+                    break
+            results = [self._build_result(cid, fused[cid], qdrant_payloads) for cid in top_ids]
+
+            # Cross-encoder rerank: re-score (query, full section text) jointly and
+            # reorder, then truncate to rerank_top_k. RRF (bi-encoder) can't separate
+            # sibling sections; the cross-encoder reads both texts together and can.
+            if self._reranker is not None and results:
+                with trace.span("rerank", input={"candidates": len(results)}) as rr:
+                    results = self._rerank_results(query, results, rerank_top_k, obs=rr)
+            else:
+                results = results[:rerank_top_k]
+
+            # Expose the original query's top dense-cosine score on every result so
+            # callers can apply a relevance floor (off-topic gate) without re-embedding.
+            for r in results:
+                r["dense_top_score"] = round(top_score, 6)
+
+            trace.end(output={
+                "top_score": round(top_score, 4),
+                "rewrite_fired": rewrite_fired,
+                "results_returned": len(results),
+            })
+            return results
+
+    def _expand_queries(self, query: str, obs: Any = NOOP_CONTEXT) -> list[str]:
+        """Return [query] or, if rewriting is enabled, the original plus LLM variants."""
+        if not self._rewrite_enabled:
+            return [query]
+        from upsc_rag.retrieval.rewrite import rewrite_query
+
+        return rewrite_query(
+            query, self._openai, model=self._rewrite_model,
+            num_variants=self._rewrite_num_variants, obs=obs,
+        )
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _dense_search(
-        self, query: str, top_k: int
-    ) -> tuple[dict[str, int], dict[str, dict]]:
-        query_vector = self._embed_query(query)
-        response = self._qdrant.query_points(
-            collection_name=self._collection,
-            query=query_vector,
-            limit=top_k,
-            with_payload=True,
-        )
-        hits = response.points
-        ranks = {hit.payload["chunk_id"]: rank for rank, hit in enumerate(hits)}
-        payloads = {hit.payload["chunk_id"]: hit.payload for hit in hits}
-        return ranks, payloads
+    def _parent_of(self, chunk_id: str, qdrant_payloads: dict[str, dict]) -> str | None:
+        """The parent section id of a fused chunk (from payload or in-memory chunk)."""
+        if chunk_id in qdrant_payloads:
+            return qdrant_payloads[chunk_id].get("parent_id")
+        idx = self._chunk_index.get(chunk_id)
+        if idx is not None:
+            return self._chunks[idx].get("parent_id")
+        return None
 
-    def _bm25_search(self, query: str, top_k: int) -> dict[str, int]:
-        scores = self._bm25.get_scores(tokenize(query))
-        top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k]
-        return {self._chunks[i]["id"]: rank for rank, i in enumerate(top_indices)}
+    def _is_noise_section(self, chunk_id: str, qdrant_payloads: dict[str, dict]) -> bool:
+        """True if the chunk's section is a bibliographic 'Notes and References'-type section."""
+        if not self._exclude_section_titles:
+            return False
+        if chunk_id in qdrant_payloads:
+            sp = qdrant_payloads[chunk_id].get("section_path") or []
+        else:
+            idx = self._chunk_index.get(chunk_id)
+            sp = self._chunks[idx].get("section_path", []) if idx is not None else []
+        return bool(sp) and sp[-1].strip().lower() in self._exclude_section_titles
+
+    def _graph_expand(self, fused: dict[str, float], qdrant_payloads: dict[str, dict]) -> None:
+        """Mutate ``fused`` in place: add graph-related sections as new candidates.
+
+        Seeds are the parent sections of the current top fused chunks. Each neighbour
+        section returned by the graph is represented by one of its child chunks and
+        given an RRF contribution (scaled by ``graph.rrf_weight``) keyed off its graph
+        rank, so the strongest cross-references can climb into the final top-k.
+        """
+        from upsc_rag.indexing.graph_store import expand_sections
+
+        ranked = sorted(fused, key=lambda cid: fused[cid], reverse=True)
+        seeds: list[str] = []
+        seen: set[str] = set()
+        for cid in ranked[: self._graph_seed_sections]:
+            pid = self._parent_of(cid, qdrant_payloads)
+            if pid and pid not in seen:
+                seen.add(pid)
+                seeds.append(pid)
+
+        neighbours = expand_sections(
+            self._graph, seeds, max_neighbors=self._graph_max_neighbors
+        )
+        for rank, section_id in enumerate(neighbours):
+            children = self._section_children.get(section_id)
+            if not children:
+                continue
+            rep = children[0]
+            fused[rep] = fused.get(rep, 0.0) + self._graph_rrf_weight * _rrf_score(rank)
+
+    def _search_one(
+        self, query: str, top_k: int, obs: Any = NOOP_CONTEXT
+    ) -> tuple[dict[str, int], dict[str, int], dict[str, dict]]:
+        """Run dense + BM25 for a single query variant (called concurrently per variant)."""
+        dense_ranks, payloads, _ = self._dense_search(query, top_k, obs=obs)
+        bm25_ranks = self._bm25_search(query, top_k, obs=obs)
+        return dense_ranks, bm25_ranks, payloads
+
+    def _dense_search(
+        self, query: str, top_k: int, obs: Any = NOOP_CONTEXT
+    ) -> tuple[dict[str, int], dict[str, dict], float]:
+        # Embedding is a billable model call — trace it as a generation so Langfuse
+        # records its token usage and computes cost (like the answer generation).
+        embed = obs.generation("embed_query", model=self._embedding_model, input=query)
+        with embed:
+            query_vector, usage = self._embed_query(query)
+            embed.end(usage=usage)
+        with obs.span("qdrant_search", input={"top_k": top_k}) as s:
+            response = self._qdrant.query_points(
+                collection_name=self._collection,
+                query=query_vector,
+                limit=top_k,
+                with_payload=True,
+            )
+            hits = response.points
+            ranks = {hit.payload["chunk_id"]: rank for rank, hit in enumerate(hits)}
+            payloads = {hit.payload["chunk_id"]: hit.payload for hit in hits}
+            top_score = hits[0].score if hits else 0.0
+            s.end(output={"hits": len(hits), "top_score": round(top_score, 4)})
+        return ranks, payloads, top_score
+
+    def _bm25_search(self, query: str, top_k: int, obs: Any = NOOP_CONTEXT) -> dict[str, int]:
+        with obs.span("bm25_search", input={"top_k": top_k}):
+            scores = self._bm25.get_scores(tokenize(query))
+            top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k]
+            return {self._chunks[i]["id"]: rank for rank, i in enumerate(top_indices)}
 
     @staticmethod
-    def _rrf_fuse(
-        dense_ranks: dict[str, int], bm25_ranks: dict[str, int]
-    ) -> dict[str, float]:
-        all_ids = set(dense_ranks) | set(bm25_ranks)
+    def _rrf_fuse(rank_lists: list[dict[str, int]]) -> dict[str, float]:
+        """Reciprocal Rank Fusion across any number of rank lists (dense, BM25, per-variant)."""
         fused: dict[str, float] = {}
-        for cid in all_ids:
-            score = 0.0
-            if cid in dense_ranks:
-                score += _rrf_score(dense_ranks[cid])
-            if cid in bm25_ranks:
-                score += _rrf_score(bm25_ranks[cid])
-            fused[cid] = score
+        for ranks in rank_lists:
+            for cid, rank in ranks.items():
+                fused[cid] = fused.get(cid, 0.0) + _rrf_score(rank)
         return fused
 
     def _build_result(
@@ -150,6 +466,18 @@ class HybridRetriever:
             )
             p = chunk  # field names match except chunk_id vs id (handled below)
 
+        # Articles named in the returned text (parent section), not the embedded child
+        # span — the child often omits the reference the parent carries.
+        entities = set(extract_entities(text))
+        # Plus the section's catalog articles: Laxmikanth's prose names the topic but
+        # the article number lives only in the chapter's "at a Glance" table. Section-
+        # precise attribution (keyed by parent_id) is preferred; the coarse chapter-wide
+        # union is the legacy fallback when catalog.match == 'chapter'.
+        if self._section_articles:
+            entities |= self._section_articles.get(p.get("parent_id"), set())
+        elif self._chapter_articles:
+            entities |= self._chapter_articles.get(p.get("chapter_num"), set())
+
         return {
             "chunk_id": chunk_id,
             "text": text,
@@ -159,10 +487,66 @@ class HybridRetriever:
             "part": p.get("part"),
             "page_start": p.get("page_start"),
             "page_end": p.get("page_end"),
-            "entities": p.get("entities", []),
+            "entities": sorted(entities),
             "rrf_score": round(rrf_score, 6),
         }
 
-    def _embed_query(self, query: str) -> list[float]:
+    def _rerank_results(
+        self,
+        query: str,
+        results: list[dict[str, Any]],
+        rerank_top_k: int,
+        obs: Any = NOOP_CONTEXT,
+    ) -> list[dict[str, Any]]:
+        """Blend the cross-encoder score with the RRF score, reorder, truncate.
+
+        Scores each result's full section ``text`` against the query with the
+        cross-encoder, then combines it with the incoming RRF score as
+        ``weight*rerank + (1-weight)*rrf`` after min-max normalizing BOTH over the
+        candidate pool. Blending (rather than replacing the order) keeps the fusion
+        signal, so the cross-encoder refines ranking without catastrophically
+        demoting a strong RRF hit or dropping it out of top-k. Attaches
+        ``rerank_score`` and ``blend_score`` to each result; returns top
+        ``rerank_top_k``. On any reranker failure, falls back to RRF order.
+        """
+        by_id = {r["chunk_id"]: r for r in results}
+        candidates = [(r["chunk_id"], r.get("text", "")) for r in results]
+        try:
+            scored = self._reranker.rerank(query, candidates)
+        except Exception as exc:  # pragma: no cover — degrade gracefully, keep RRF order
+            obs.end(output={"error": str(exc), "fell_back": True})
+            return results[:rerank_top_k]
+
+        rerank_by_id = {cid: score for cid, score in scored}
+        rrf_by_id = {r["chunk_id"]: r.get("rrf_score", 0.0) for r in results}
+        norm_rerank = self._minmax(rerank_by_id)
+        norm_rrf = self._minmax(rrf_by_id)
+
+        w = self._rerank_weight
+        for r in results:
+            cid = r["chunk_id"]
+            r["rerank_score"] = round(float(rerank_by_id.get(cid, 0.0)), 6)
+            r["blend_score"] = round(
+                w * norm_rerank.get(cid, 0.0) + (1.0 - w) * norm_rrf.get(cid, 0.0), 6
+            )
+        reordered = sorted(results, key=lambda r: r["blend_score"], reverse=True)
+        obs.end(output={"reranked": len(reordered), "kept": min(rerank_top_k, len(reordered))})
+        return reordered[:rerank_top_k]
+
+    @staticmethod
+    def _minmax(scores: dict[str, float]) -> dict[str, float]:
+        """Min-max normalize a {id: score} map to [0, 1]; flat input maps to all 1.0."""
+        if not scores:
+            return {}
+        vals = scores.values()
+        lo, hi = min(vals), max(vals)
+        if hi <= lo:
+            return {k: 1.0 for k in scores}
+        span = hi - lo
+        return {k: (v - lo) / span for k, v in scores.items()}
+
+    def _embed_query(self, query: str) -> tuple[list[float], dict[str, int]]:
+        """Return the query embedding plus token usage (for cost tracing)."""
         response = self._openai.embeddings.create(input=[query], model=self._embedding_model)
-        return response.data[0].embedding
+        usage = {"input": response.usage.prompt_tokens, "total": response.usage.total_tokens}
+        return response.data[0].embedding, usage
