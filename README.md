@@ -52,6 +52,36 @@ Browser (Next.js chat)            FastAPI (Python)               Services
 
 The Next.js route handler (`web/app/api/ask/route.ts`) is a same-origin proxy that forwards to FastAPI and pipes the NDJSON stream back — so the browser never deals with CORS and the backend URL stays server-side.
 
+### Orchestration backends
+
+The request flow (smalltalk gate → retrieve → relevance gate → generate) ships in two
+interchangeable forms behind an env flag — the default keeps the original direct code path,
+and graph mode runs the same steps as a **LangGraph** state machine:
+
+```
+default                                   UPSC_RAG_PIPELINE=graph
+FastAPI calls the functions directly      FastAPI invokes a compiled LangGraph:
+  smalltalk_reply()                         START → smalltalk ─(smalltalk)→ END
+  → HybridRetriever.retrieve()                       └(answer)→ retrieve → gate ─(off_topic)→ END
+  → is_off_topic()                                                          └(answer)→ generate → END
+  → generate_answer[_stream]()
+```
+
+The graph **wraps the existing functions as thin nodes** — it does *not* reimplement the
+retriever, RRF, FlashRank rerank, or catalog logic — so retrieval/generation behavior (and the
+eval numbers) are unchanged; only orchestration differs. Sources are deduped identically by a
+shared `generation/sources.py` helper, and `/ask/stream` keeps the same NDJSON contract (the
+graph drives routing + retrieval, then tokens stream through `generate_answer_stream`). An
+optional `UPSC_RAG_LLM_BACKEND=langchain` flag routes generation through `ChatOpenAI`
+(`llm/clients.py`) as a provider-portability seam (off by default). See the `graph/` package and
+the `orchestration` stage in `progress.json`.
+
+```powershell
+# run the backend on the LangGraph path
+$env:UPSC_RAG_PIPELINE = "graph"
+python -m uvicorn upsc_rag.api.app:app --reload --port 8000
+```
+
 ---
 
 ## Quick start
@@ -116,7 +146,9 @@ Structured-RAG/
 │   ├── enrichment/           # syllabus_tags, entities
 │   ├── indexing/             # JSONL store, OpenAI embedder, Qdrant store
 │   ├── retrieval/            # HybridRetriever (dense + BM25 + RRF), rewrite, cross-encoder rerank
-│   ├── generation/           # build_answer_prompt, generate_answer[_stream]
+│   ├── generation/           # build_answer_prompt, generate_answer[_stream], sources (dedupe)
+│   ├── graph/                # LangGraph orchestration (UPSC_RAG_PIPELINE=graph): state, nodes, build, runner
+│   ├── llm/                  # ChatOpenAI/OpenAIEmbeddings adapters (optional portability seam)
 │   ├── api/                  # FastAPI app (/ask, /ask/stream, /health)
 │   ├── eval/                 # retrieval-quality harness (hit@k, MRR, article_recall)
 │   └── pipeline/             # run_ingest, run_embed orchestration
@@ -418,6 +450,7 @@ detector. Tightening generation faithfulness (abstain when sources are thin) is 
 - [x] Retrieval-quality eval harness + labeled gold set (hit@k, MRR, article_recall)
 - [x] Reranker (cross-encoder, FlashRank) blended with RRF candidates
 - [x] Generation-quality eval — 3 cheap signals (article recall, citation, groundedness) — no LLM judge
+- [x] LangGraph orchestration backend (parallel path behind `UPSC_RAG_PIPELINE=graph`) + LangChain LLM portability seam
 - [ ] LLM-judge rubric (completeness / exam-appropriateness) + generation faithfulness (abstain on thin sources)
 - [ ] Multi-book support in the UI (book selector)
 ```

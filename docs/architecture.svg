@@ -15,6 +15,9 @@
     <marker id="arrow-cyan" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
       <path d="M0,0 L0,6 L8,3 z" fill="#22d3ee"/>
     </marker>
+    <marker id="arrow-indigo" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#818cf8"/>
+    </marker>
     <filter id="shadow" x="-5%" y="-5%" width="110%" height="110%">
       <feDropShadow dx="2" dy="2" stdDeviation="3" flood-color="#000" flood-opacity="0.4"/>
     </filter>
@@ -24,7 +27,7 @@
 
   <!-- Title -->
   <text x="560" y="38" text-anchor="middle" font-size="18" font-weight="700" fill="#f1f5f9">UPSC-RAG · End-to-End Architecture</text>
-  <text x="560" y="58" text-anchor="middle" font-size="11" fill="#64748b">Offline build (top) · Request-time (below)</text>
+  <text x="560" y="58" text-anchor="middle" font-size="11" fill="#64748b">Offline build (top) · Request-time (below) · orchestration: direct path (default) or LangGraph (UPSC_RAG_PIPELINE=graph)</text>
 
   <!-- ════════════ OFFLINE ════════════ -->
   <rect x="20" y="74" width="1080" height="150" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1"/>
@@ -45,7 +48,7 @@
   <!-- Chunking -->
   <rect x="270" y="112" width="104" height="46" rx="6" fill="#1e293b" stroke="#475569" stroke-width="1.5" filter="url(#shadow)"/>
   <text x="322" y="132" text-anchor="middle" font-size="11" font-weight="600" fill="#cbd5e1">Chunking</text>
-  <text x="322" y="148" text-anchor="middle" font-size="8" fill="#94a3b8">366 parent · 1469 child</text>
+  <text x="322" y="148" text-anchor="middle" font-size="8" fill="#94a3b8">516 parent · 1140 child</text>
   <line x1="374" y1="135" x2="400" y2="135" stroke="#60a5fa" stroke-width="1.5" marker-end="url(#arrow-blue)"/>
 
   <!-- Enrichment -->
@@ -63,7 +66,7 @@
   <!-- Qdrant (build) -->
   <rect x="666" y="108" width="138" height="54" rx="6" fill="#1a2e1a" stroke="#22c55e" stroke-width="1.5" filter="url(#shadow)"/>
   <text x="735" y="128" text-anchor="middle" font-size="12" font-weight="600" fill="#86efac">Qdrant</text>
-  <text x="735" y="143" text-anchor="middle" font-size="8" fill="#4ade80">upsc_polity · 1319 pts</text>
+  <text x="735" y="143" text-anchor="middle" font-size="8" fill="#4ade80">upsc_polity · 1140 pts</text>
   <text x="735" y="155" text-anchor="middle" font-size="8" fill="#4ade80">3072-d cosine · parent_text</text>
 
   <!-- graph.pkl shelved -->
@@ -112,8 +115,8 @@
   <text x="585" y="283" text-anchor="middle" font-size="12" font-weight="700" fill="#d8b4fe">FastAPI</text>
   <text x="585" y="299" text-anchor="middle" font-size="8" fill="#c084fc">backend · port 8000</text>
   <text x="585" y="313" text-anchor="middle" font-size="8" fill="#c084fc">POST /ask/stream</text>
-  <text x="585" y="327" text-anchor="middle" font-size="8" fill="#c084fc">retriever built at startup</text>
-  <text x="585" y="341" text-anchor="middle" font-size="8" fill="#c084fc">reused per request</text>
+  <text x="585" y="327" text-anchor="middle" font-size="8" fill="#c084fc">retriever built at startup · reused</text>
+  <text x="585" y="341" text-anchor="middle" font-size="8" fill="#a5b4fc">graph mode → LangGraph pipeline ▸</text>
 
   <!-- ════════════ QUERY GATE · router.py (NEW) ════════════ -->
   <rect x="686" y="255" width="200" height="82" rx="8" fill="#2a1e0e" stroke="#f59e0b" stroke-width="1.5" filter="url(#shadow)"/>
@@ -121,7 +124,7 @@
   <text x="786" y="291" text-anchor="middle" font-size="8" fill="#fbbf24">① pre-retrieval · greeting / smalltalk regex</text>
   <text x="786" y="304" text-anchor="middle" font-size="8" fill="#fbbf24">② post-retrieval · top dense cosine &lt; 0.30</text>
   <text x="786" y="318" text-anchor="middle" font-size="8" fill="#d97706">match → short-circuit, skip generation</text>
-  <text x="786" y="330" text-anchor="middle" font-size="7.5" fill="#a16207">★ NEW · smalltalk_reply() · is_off_topic()</text>
+  <text x="786" y="330" text-anchor="middle" font-size="7.5" fill="#a16207">smalltalk_reply() · is_off_topic()  ·  graph nodes: smalltalk + gate</text>
 
   <!-- FastAPI → Query Gate -->
   <line x1="670" y1="288" x2="686" y2="288" stroke="#fbbf24" stroke-width="1.5" marker-end="url(#arrow-amber)"/>
@@ -137,6 +140,19 @@
   <!-- FastAPI → Retriever (in-scope path) -->
   <line x1="585" y1="348" x2="585" y2="392" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrow)"/>
   <text x="648" y="372" text-anchor="middle" font-size="8" fill="#94a3b8">in-scope → retrieve</text>
+
+  <!-- ════════════ LANGGRAPH ORCHESTRATION (graph mode) ════════════ -->
+  <rect x="896" y="256" width="200" height="86" rx="8" fill="#1a1a2e" stroke="#818cf8" stroke-width="1.5" filter="url(#shadow)"/>
+  <text x="996" y="275" text-anchor="middle" font-size="11" font-weight="700" fill="#a5b4fc">LangGraph · ask graph  ★ NEW</text>
+  <text x="996" y="291" text-anchor="middle" font-size="7.5" fill="#818cf8">graph mode · UPSC_RAG_PIPELINE=graph</text>
+  <text x="996" y="304" text-anchor="middle" font-size="7.5" fill="#818cf8">smalltalk → retrieve → gate → generate</text>
+  <text x="996" y="317" text-anchor="middle" font-size="7.5" fill="#818cf8">nodes wrap existing fns (RRF/rerank intact)</text>
+  <text x="996" y="330" text-anchor="middle" font-size="7.5" fill="#64748b">default API path = direct calls (unchanged)</text>
+  <!-- graph orchestrates the gate -->
+  <line x1="896" y1="298" x2="886" y2="298" stroke="#818cf8" stroke-width="1.5" marker-end="url(#arrow-indigo)"/>
+  <!-- graph drives the retriever + generation -->
+  <line x1="980" y1="342" x2="882" y2="408" stroke="#818cf8" stroke-width="1.5" stroke-dasharray="5,3" marker-end="url(#arrow-indigo)"/>
+  <text x="952" y="382" text-anchor="middle" font-size="7.5" fill="#818cf8">orchestrates</text>
 
   <!-- ════════════ HYBRID RETRIEVER ════════════ -->
   <rect x="60" y="396" width="820" height="372" rx="10" fill="#1a1a2e" stroke="#6366f1" stroke-width="2" filter="url(#shadow)"/>
@@ -261,7 +277,8 @@
   <text x="404" y="944" font-size="9" fill="#fcd34d">★ Catalog enrichment (new) · article_recall 50% → 75%</text>
   <rect x="640" y="935" width="14" height="9" rx="2" fill="#374151" stroke="#334155" stroke-width="1" stroke-dasharray="3,2"/>
   <text x="662" y="944" font-size="9" fill="#6b7280">Shelved (graph expansion)</text>
-  <rect x="838" y="935" width="14" height="9" rx="2" fill="#22d3ee" opacity="0.7"/>
-  <text x="860" y="944" font-size="9" fill="#67e8f9">Telemetry → Langfuse</text>
-  <text x="1075" y="944" text-anchor="end" font-size="9" fill="#475569">UPSC-RAG</text>
+  <rect x="800" y="935" width="14" height="9" rx="2" fill="#22d3ee" opacity="0.7"/>
+  <text x="822" y="944" font-size="9" fill="#67e8f9">Telemetry → Langfuse</text>
+  <rect x="956" y="935" width="14" height="9" rx="2" fill="#818cf8" opacity="0.85"/>
+  <text x="978" y="944" font-size="9" fill="#a5b4fc">★ LangGraph (graph mode)</text>
 </svg>

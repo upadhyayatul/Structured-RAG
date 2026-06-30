@@ -25,10 +25,15 @@ from pydantic import BaseModel, Field
 from upsc_rag.config import get_settings, load_runtime_config
 from upsc_rag.generation.answer import generate_answer, generate_answer_stream
 from upsc_rag.generation.router import OUT_OF_SCOPE_REPLY, is_off_topic, smalltalk_reply
+from upsc_rag.generation.sources import build_source_dicts
 from upsc_rag.retrieval.hybrid import HybridRetriever
 
 # Default book served by the API; override with UPSC_RAG_BOOK env var.
 BOOK_ID = os.environ.get("UPSC_RAG_BOOK", "laxmikanth_6")
+
+# Orchestration backend: "graph" routes /ask + /ask/stream through the LangGraph
+# pipeline (built once in lifespan); anything else uses the direct path (default).
+USE_GRAPH = os.environ.get("UPSC_RAG_PIPELINE", "").lower() == "graph"
 
 # Populated at startup, reused across requests.
 _state: dict[str, Any] = {}
@@ -41,7 +46,13 @@ async def lifespan(app: FastAPI):
     cfg = load_runtime_config(BOOK_ID)
     chunks_path = settings.resolve(settings.processed_dir) / BOOK_ID / "chunks.jsonl"
     _state["cfg"] = cfg
-    _state["retriever"] = HybridRetriever(cfg, chunks_path)
+    retriever = HybridRetriever(cfg, chunks_path)
+    _state["retriever"] = retriever
+    # Build the LangGraph pipeline once if graph mode is selected (reused per request).
+    if USE_GRAPH:
+        from upsc_rag.graph import build_ask_graph
+
+        _state["graph"] = build_ask_graph(retriever, cfg)
     yield
     _state.clear()
 
@@ -84,24 +95,7 @@ class AskResponse(BaseModel):
 
 def _build_sources(results: list[dict[str, Any]]) -> list[Source]:
     """Turn retrieval results into Source objects, deduped by section+pages, renumbered."""
-    seen: set[str] = set()
-    sources: list[Source] = []
-    for r in results:
-        path = r.get("section_path") or []
-        key = f"{' > '.join(path)}|{r.get('page_start')}-{r.get('page_end')}"
-        if key in seen:
-            continue
-        seen.add(key)
-        sources.append(
-            Source(
-                n=len(sources) + 1,
-                section_path=path,
-                chapter_title=r.get("chapter_title", ""),
-                page_start=r.get("page_start"),
-                page_end=r.get("page_end"),
-            )
-        )
-    return sources
+    return [Source(**s) for s in build_source_dicts(results)]
 
 
 @app.get("/health")
@@ -116,6 +110,17 @@ def ask(req: AskRequest) -> AskResponse:
     retriever: HybridRetriever | None = _state.get("retriever")
     if retriever is None:
         raise HTTPException(status_code=503, detail="Retriever not ready")
+
+    # Graph mode: the LangGraph pipeline runs the same gates + retrieve + generate.
+    if USE_GRAPH:
+        from upsc_rag.graph import run_ask
+
+        final = run_ask(
+            _state["graph"], req.query, top_k=req.top_k,
+            rerank_top_k=req.rerank_top_k, session_id=req.session_id,
+        )
+        sources = [Source(**s) for s in final.get("sources", [])]
+        return AskResponse(answer=final.get("answer", ""), sources=sources)
 
     # Gate 1: pure greeting / chit-chat — reply without retrieving or generating.
     canned = smalltalk_reply(req.query)
@@ -157,21 +162,36 @@ def ask_stream(req: AskRequest) -> StreamingResponse:
             {"type": "done", "cost_usd": 0.0, "input_tokens": 0, "output_tokens": 0}
         ) + "\n"
 
-    # Gate 1: pure greeting / chit-chat — reply without retrieving or generating.
-    canned = smalltalk_reply(req.query)
-    if canned is not None:
-        return StreamingResponse(canned_stream(canned), media_type="application/x-ndjson")
+    # Graph mode: run the smalltalk → retrieve → gate prefix through the graph nodes,
+    # then stream tokens below exactly as the direct path does (same NDJSON contract).
+    if USE_GRAPH:
+        from upsc_rag.graph import prepare_stream
 
-    results = retriever.retrieve(
-        req.query, top_k=req.top_k, rerank_top_k=req.rerank_top_k, session_id=req.session_id
-    )
-
-    # Gate 2: real question, but no relevant source in the book — skip generation.
-    floor = _state["cfg"].get("retrieval", {}).get("relevance_floor", 0.0)
-    if is_off_topic(results, floor):
-        return StreamingResponse(
-            canned_stream(OUT_OF_SCOPE_REPLY), media_type="application/x-ndjson"
+        prep = prepare_stream(
+            retriever, _state["cfg"], req.query, top_k=req.top_k,
+            rerank_top_k=req.rerank_top_k, session_id=req.session_id,
         )
+        if prep["route"] != "answer":
+            return StreamingResponse(
+                canned_stream(prep["answer"]), media_type="application/x-ndjson"
+            )
+        results = prep["results"]
+    else:
+        # Gate 1: pure greeting / chit-chat — reply without retrieving or generating.
+        canned = smalltalk_reply(req.query)
+        if canned is not None:
+            return StreamingResponse(canned_stream(canned), media_type="application/x-ndjson")
+
+        results = retriever.retrieve(
+            req.query, top_k=req.top_k, rerank_top_k=req.rerank_top_k, session_id=req.session_id
+        )
+
+        # Gate 2: real question, but no relevant source in the book — skip generation.
+        floor = _state["cfg"].get("retrieval", {}).get("relevance_floor", 0.0)
+        if is_off_topic(results, floor):
+            return StreamingResponse(
+                canned_stream(OUT_OF_SCOPE_REPLY), media_type="application/x-ndjson"
+            )
 
     sources = _build_sources(results)
 
