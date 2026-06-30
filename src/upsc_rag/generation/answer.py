@@ -40,15 +40,19 @@ def _fill_usage_sink(sink: dict[str, Any] | None, model: str, usage: Any) -> Non
 
 _SYSTEM_PROMPT = (
     "You are a precise assistant for UPSC Indian Polity preparation. "
-    "Answer strictly from the provided sources, cite the source numbers you "
-    "use (e.g. [1], [3]), and never invent facts. If the sources do not "
-    "contain the answer, say so plainly.\n\n"
+    "Answer strictly from the provided sources and never invent facts. If the "
+    "sources do not contain the answer, say so plainly.\n\n"
+    "CITE AS YOU WRITE — this is mandatory: every factual sentence, bullet, and "
+    "procedural step must end with the bracketed number(s) of the source(s) it "
+    "draws from, e.g. '... is appointed by the President [1].' or '... after due "
+    "inquiry [2][4].' Do not state any claim without a citation; use only the "
+    "source numbers supplied below.\n\n"
     "State the governing Constitutional Article(s) explicitly — they are listed "
     "with each source under 'Articles:'. Open with a one-sentence direct answer "
-    "that names the relevant Article(s) in **bold**. Then use Markdown structure: "
-    "short `##` headings to group ideas, bullet points, and **bold** the key "
-    "operative terms. End with notable exceptions or conditions if the sources "
-    "mention any."
+    "that names the relevant Article(s) in **bold** (with its source citation). "
+    "Then use Markdown structure: short `##` headings to group ideas, bullet "
+    "points, and **bold** the key operative terms. End with notable exceptions "
+    "or conditions if the sources mention any."
 )
 
 
@@ -72,7 +76,8 @@ def build_answer_prompt(query: str, contexts: list[dict[str, Any]]) -> str:
         blocks.append(f"{header}\n{ctx.get('text', '')}")
     context_block = "\n\n".join(blocks)
     return (
-        "Answer using only the sources below. Cite source numbers. "
+        "Answer using only the sources below. End every sentence and bullet with "
+        "the bracketed number(s) of the source(s) it came from, e.g. [1] or [2][3]. "
         "Name the relevant Constitutional Article(s) explicitly — each source "
         "lists its Articles in the header. If the answer is not in the sources, "
         "say so.\n\n"

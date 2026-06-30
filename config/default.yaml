@@ -51,3 +51,8 @@ generation:
   temperature: 0.2
   max_tokens: 1024
 
+eval:
+  generation:               # cheap generation-quality signals (scripts/evaluate_generation.py) — no LLM judge
+    embed_model: text-embedding-3-small  # embedder for groundedness + answer-relevance cosines (cheap; separate from the 3-large corpus model)
+    ground_threshold: 0.65  # min cosine(answer-sentence, best source SENTENCE-window) to count a sentence as 'supported'. Raised 0.5->0.65 once groundedness matched sentence windows (not whole sections): window-matching lifts the support floor (mean ~0.76), so 0.5 saturated at ~99% and lost discriminative power
+

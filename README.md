@@ -32,9 +32,9 @@ flowchart LR
 | 7. Answer | `generation/` | LLM prompt with cited sources (OpenAI) | ✅ Done |
 | 8. Serve | `api/` | FastAPI `/ask` + streaming `/ask/stream` | ✅ Done |
 | 9. UI | `web/` | Next.js streaming chat with citations | ✅ Done |
-| 10. Evaluate | `eval/` | Retrieval-quality harness on a labeled gold set | 🟡 In progress |
+| 10. Evaluate | `eval/` | Retrieval + cheap generation-quality harnesses on a labeled gold set | 🟡 In progress |
 
-**Current status:** Full pipeline works end-to-end — ingest → embed → hybrid retrieve → LLM answer, exposed via FastAPI and a Next.js chat UI with token streaming. A retrieval-quality evaluation harness is in place (see [Evaluation](#evaluation)); a generation-quality (groundedness/citation) judge is the remaining gap. See `progress.json` for details.
+**Current status:** Full pipeline works end-to-end — ingest → embed → hybrid retrieve → LLM answer, exposed via FastAPI and a Next.js chat UI with token streaming. Both a retrieval-quality harness and a cheap generation-quality harness (groundedness + citation, no LLM judge) are in place (see [Evaluation](#evaluation)); a nuanced LLM-judge rubric is the remaining gap. See `progress.json` for details.
 
 ---
 
@@ -264,9 +264,9 @@ python scripts/evaluate.py --rerank 8 --no-rerank    # A/B a single layer
 | article_recall | **95.5 %** (21/22) |
 | avg_articles_on_hit | **4.2** |
 
-The one remaining miss is a known catalog data gap (Article 361 immunity). The harness is
-**retrieval-only**; an end-to-end generation-quality eval (groundedness + citation
-correctness) is the next addition.
+The one remaining miss is a known catalog data gap (Article 361 immunity). This harness is
+**retrieval-only**; a complementary **generation-quality** harness scores the answers
+themselves — see [Generation-quality eval](#generation-quality-eval-3-cheap-signals--no-llm-judge) below.
 
 ### Cross-encoder reranking (FlashRank)
 
@@ -320,6 +320,80 @@ python scripts/evaluate.py --rerank 8 --no-rerank   # A/B: rerank OFF
 > **alignment bug** where some chunks held the wrong section's text. Correcting it moved hit@k
 > from 76.7 % → 93.3 % and article_recall from 77.3 % → 95.5 %.
 
+### Generation-quality eval (3 cheap signals — no LLM judge)
+
+Retrieval being correct doesn't mean the *answer* is. On top of the retrieval harness, a
+second harness scores the **generated answer** with three signals that are cheap enough to run
+on every answer — a deterministic regex check plus two small-embedding cosines (no GPT judge,
+which is reserved for a later nuanced rubric):
+
+| Signal | How it's measured | Catches |
+|--------|-------------------|---------|
+| **article_recall** | deterministic — does the answer name the gold Constitutional Article? | Missing the citable Article |
+| **uncited_answer_rate** | deterministic — fraction of answers with **no** `[n]` source marker at all | Answers that cite nothing |
+| **grounded_fraction** | embedding cosine — share of answer sentences whose best match to a source *sentence-window* clears a threshold (0.65) | Claims not supported by the sources (hallucination / corpus gap) |
+| **answer_relevance** | embedding cosine — answer centroid vs the question | Off-topic drift |
+
+The three signals trade off cost against what they can see. Two are **deterministic** (a regex
+and a string check — free, exact, reproducible); two are **embedding cosines** (one cheap
+`text-embedding-3-small` call per answer — far cheaper than asking a second LLM to judge). None
+of them call a judge model, which is the whole point: they're cheap enough to run on *every*
+answer, so an LLM judge can be reserved for the nuanced rubric (completeness, exam-appropriateness)
+later.
+
+**1. Citation correctness (deterministic).** Two checks read straight off the answer text.
+*`article_recall`* reuses the same `\bArticle\s+\d+[A-Z]?\b` regex as the rest of the pipeline to
+ask: did the answer actually print the governing Article the gold set expects (e.g. *Article 124*)?
+*`uncited_answer_rate`* counts answers that carry **no** `[n]` source marker at all — the real
+"did it cite anything?" signal. (A companion `cited_fraction` exists but is intentionally *not* a
+target: it divides by all the sources supplied, and a focused answer legitimately uses only a
+subset, so < 100 % is correct.) Because these are exact string operations, the same answer always
+yields the same score.
+
+**2. Groundedness (embedding cosine).** The hallucination proxy. The answer is split into
+sentences and each source section into *sentence-windows*; every answer sentence is embedded and
+matched to its best-cosine source window. `grounded_fraction` is the share of sentences whose best
+match clears **0.65** (`mean_support` reports the average best-cosine). The intuition: a faithful
+sentence has a near-paraphrase somewhere in the sources, so it scores high; a sentence the model
+invented (or pulled from its training memory) has no close match and falls below the threshold.
+Matching against *windows* rather than whole sections matters — embedding a 2 000-char section as
+one vector washes out short, reworded claims, which is what made procedural answers look
+ungrounded before the fix.
+
+**3. Answer relevance (embedding cosine).** A lightweight "did it stay on topic?" check: cosine
+between the centroid of the answer's sentence embeddings and the question embedding. It won't
+catch a *wrong* answer (groundedness does that), but it flags an answer that drifts off the
+question entirely.
+
+```powershell
+python scripts/evaluate_generation.py --rerank 8            # score generation over the gold set
+python scripts/evaluate_generation.py --rerank 8 --limit 5  # sample a few (cost control)
+```
+
+**Results** (30 questions, `rerank_top_k=8`). Two fixes were driven directly by these signals:
+
+| Signal | Before | After | Fix |
+|--------|:------:|:-----:|-----|
+| article_recall (in answer) | 100 % | 95.5 %\* | — |
+| **uncited_answer_rate** | **17 %** (5/30) | **0 %** | Strengthened the prompt to require a `[n]` per claim |
+| grounded_fraction | 68 %† | **81 %** | Match answer sentences to source *sentence-windows*, not whole sections |
+| mean_support (cosine) | 0.555 | 0.758 | — |
+| answer_relevance | 0.669 | 0.682 | — |
+
+<sub>\* one run-to-run flip at `temperature 0.2`, not a regression. † the 68 % was a *measurement
+artifact*: embedding a whole ~2 000-char section as one vector diluted support for short
+paraphrased steps. Sentence-window matching removed it (procedural answers like impeachment went
+8 %→100 %); the threshold was then raised 0.5→0.65 to keep the metric discriminative.</sub>
+
+**Why groundedness earns its keep.** Spot-checking a flagged answer (*"is privacy a fundamental
+right?"*, 25 % grounded) exposed a real failure the other signals miss: the book is the **6th ed.
+(2011), which predates the Puttaswamy privacy judgment (2017)**, so the corpus has no
+privacy-as-a-fundamental-right content. Retrieval behaved correctly, but the LLM answered
+confidently **from its own training knowledge** — citing valid `[2][3]` markers that don't
+actually support the claim. `uncited_answer_rate` and citation-validity both pass; only
+**groundedness catches off-source embellishment**, doubling as a corpus-gap / hallucination
+detector. Tightening generation faithfulness (abstain when sources are thin) is the next lever.
+
 ---
 
 ## Design principles
@@ -343,6 +417,7 @@ python scripts/evaluate.py --rerank 8 --no-rerank   # A/B: rerank OFF
 - [x] Next.js streaming chat UI with markdown + citations
 - [x] Retrieval-quality eval harness + labeled gold set (hit@k, MRR, article_recall)
 - [x] Reranker (cross-encoder, FlashRank) blended with RRF candidates
-- [ ] Generation-quality eval (groundedness + citation correctness, LLM judge)
+- [x] Generation-quality eval — 3 cheap signals (article recall, citation, groundedness) — no LLM judge
+- [ ] LLM-judge rubric (completeness / exam-appropriateness) + generation faithfulness (abstain on thin sources)
 - [ ] Multi-book support in the UI (book selector)
 ```
