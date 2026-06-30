@@ -1,4 +1,4 @@
-# UPSC-RAG
+# Structured-RAG
 
 Structured **retrieval-augmented generation (RAG)** for massive UPSC polity textbooks—starting with *Indian Polity* (6th ed.) by M. Laxmikanth (~1,500 pages).
 
