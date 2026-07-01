@@ -55,4 +55,12 @@ eval:
   generation:               # cheap generation-quality signals (scripts/evaluate_generation.py) — no LLM judge
     embed_model: text-embedding-3-small  # embedder for groundedness + answer-relevance cosines (cheap; separate from the 3-large corpus model)
     ground_threshold: 0.65  # min cosine(answer-sentence, best source SENTENCE-window) to count a sentence as 'supported'. Raised 0.5->0.65 once groundedness matched sentence windows (not whole sections): window-matching lifts the support floor (mean ~0.76), so 0.5 saturated at ~99% and lost discriminative power
+  judge:                    # LLM-as-judge rubric (scripts/evaluate_judge.py) — nuanced criteria the cheap signals can't cover + cross-check of them
+    base_url: https://api.openai.com/v1        # OpenAI's endpoint (reuse the openai SDK, only base_url/key differ)
+    model: gpt-5-mini                          # stronger, DIFFERENT model than the gpt-4o-mini generator, so it won't rubber-stamp the generator's own style (same-provider self-preference is reduced, not eliminated — accepted trade-off)
+    api_key_env: OPENAI_API_KEY                # same key the generator + cheap-signal embeddings use (key: https://platform.openai.com/api-keys)
+    temperature: 0.0                           # deterministic scoring for non-reasoning models; IGNORED for gpt-5/o-series (they reject temperature!=1), see judge.py._is_reasoning_model
+    reasoning_effort: low                      # gpt-5 reasoning depth for the judge: enough to apply the rubric, low to keep latency/cost down (only used for reasoning models)
+    max_source_chars: 1500                     # truncate each source shown to the judge; no per-day token cap on OpenAI, so full parent sections fit for better faithfulness grading
+    request_interval_sec: 0                    # no free-tier per-minute pacing needed on OpenAI's generous paid limits; the rate-limit backoff in judge.py is the safety net
 

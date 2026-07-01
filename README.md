@@ -32,9 +32,9 @@ flowchart LR
 | 7. Answer | `generation/` | LLM prompt with cited sources (OpenAI) | ✅ Done |
 | 8. Serve | `api/` | FastAPI `/ask` + streaming `/ask/stream` | ✅ Done |
 | 9. UI | `web/` | Next.js streaming chat with citations | ✅ Done |
-| 10. Evaluate | `eval/` | Retrieval + cheap generation-quality harnesses on a labeled gold set | 🟡 In progress |
+| 10. Evaluate | `eval/` | Retrieval, cheap generation-quality, and LLM-judge harnesses on a labeled gold set | 🟡 In progress |
 
-**Current status:** Full pipeline works end-to-end — ingest → embed → hybrid retrieve → LLM answer, exposed via FastAPI and a Next.js chat UI with token streaming. Both a retrieval-quality harness and a cheap generation-quality harness (groundedness + citation, no LLM judge) are in place (see [Evaluation](#evaluation)); a nuanced LLM-judge rubric is the remaining gap. See `progress.json` for details.
+**Current status:** Full pipeline works end-to-end — ingest → embed → hybrid retrieve → LLM answer, exposed via FastAPI and a Next.js chat UI with token streaming. Three evaluation harnesses are in place (see [Evaluation](#evaluation)): retrieval quality, a cheap generation-quality harness (groundedness + citation), and a nuanced **LLM-judge rubric** (`gpt-5-mini`) that cross-checks the cheap signals. The remaining lever is generation faithfulness (abstain when sources are thin). See `progress.json` for details.
 
 ---
 
@@ -426,6 +426,58 @@ actually support the claim. `uncited_answer_rate` and citation-validity both pas
 **groundedness catches off-source embellishment**, doubling as a corpus-gap / hallucination
 detector. Tightening generation faithfulness (abstain when sources are thin) is the next lever.
 
+### LLM-as-judge (nuanced rubric — cross-checks the cheap signals)
+
+The cheap signals are deliberately shallow — a regex and two cosines. They can't score whether an
+answer is **complete** or **exam-appropriate**, and their faithfulness signal is only a cosine
+proxy. A rubric **LLM judge** grades each answer 1–5 on four criteria the cheap signals can't see —
+*faithfulness, completeness, exam_appropriateness, citation_quality* — and, run on the *same*
+answers, tells us whether the cheap gates are trustworthy stand-ins for it.
+
+The judge is **`gpt-5-mini` on OpenAI** — deliberately a *different, stronger* model than the
+`gpt-4o-mini` generator, so it doesn't rubber-stamp the generator's own style (same-provider
+self-preference is reduced, not eliminated). Because gpt-5 is a *reasoning* model that rejects
+`temperature != 1`, the judge call omits `temperature` and passes `reasoning_effort` instead.
+
+```powershell
+python scripts/evaluate_judge.py --rerank 8            # judge + cheap signals on the same answers
+python scripts/evaluate_judge.py --rerank 8 --limit 5  # sample a few (cost control)
+```
+
+**Baseline snapshot** (30 questions, `rerank_top_k=8`, `gpt-5-mini`, 2026-07-01). Treat these as a
+*versioned baseline*, not a fixed grade — they will move as generation is tuned (faithfulness/
+citation are the open levers below), and the judge is intentionally strict, so the absolute numbers
+read lower than the cheap cosines:
+
+| Judge criterion (1–5) | Mean | Cheap-signal counterpart |
+|-----------------------|:----:|--------------------------|
+| faithfulness | 3.37 | grounded_fraction 84 % |
+| completeness | 3.67 | — |
+| exam_appropriateness | 3.70 | — |
+| citation_quality | 3.00 | cited_fraction 33 % |
+| **overall** | **3.43 (69 %)** | — |
+
+**The finding is the correlation, not the score.** Per question, the cheap proxies track the judge
+only *weakly* (faithfulness ↔ grounded_fraction `r ≈ +0.26`, citation_quality ↔ cited_fraction
+`r ≈ +0.31` at n=30). So the cheap signals are a fine **always-on gate**, but **not a substitute**
+for the judge on faithfulness/citation nuance — which is exactly what the judge is for. Where they
+disagree is where the judge earns its keep:
+
+- **Cheap false-pass** — the *73rd-amendment* answer scored 92 % grounded but the judge gave
+  faithfulness **2/5**: it invented specifics (Gram Sabha = "all registered voters", "proportional"
+  reservation) not in the sources. The cosine's near-paraphrase check missed them.
+- **Misattributed citation** — the *self-incrimination* answer scored 71 % grounded but faithfulness
+  **1/5**: it cites an Article-19 source for Article-20(3) claims. Citation-*validity* passes (the
+  marker is a real source number); only the judge sees the source doesn't support the claim.
+- **Cheap false-negative** — the *DPSP-binding* answer scored just 38 % grounded (heavy paraphrase)
+  but the judge confirmed faithfulness **5/5**: the claims *are* supported, the cosine was overly
+  pessimistic.
+
+**Takeaway:** keep the cheap signals as the cheap gate on every answer, and reserve the judge for
+periodic deep checks and to audit the cheap signal's false-passes. The judge's main critique —
+off-source embellishment and loose citations — is the same **generation-faithfulness** lever the
+groundedness section flagged, now quantified per-criterion.
+
 ---
 
 ## Design principles
@@ -451,6 +503,7 @@ detector. Tightening generation faithfulness (abstain when sources are thin) is 
 - [x] Reranker (cross-encoder, FlashRank) blended with RRF candidates
 - [x] Generation-quality eval — 3 cheap signals (article recall, citation, groundedness) — no LLM judge
 - [x] LangGraph orchestration backend (parallel path behind `UPSC_RAG_PIPELINE=graph`) + LangChain LLM portability seam
-- [ ] LLM-judge rubric (completeness / exam-appropriateness) + generation faithfulness (abstain on thin sources)
+- [x] LLM-judge rubric (faithfulness / completeness / exam-appropriateness / citation) cross-checked against the cheap signals (`gpt-5-mini`)
+- [ ] Generation faithfulness — abstain / qualify when sources are thin (the judge's main critique)
 - [ ] Multi-book support in the UI (book selector)
 ```
