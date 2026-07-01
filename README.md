@@ -34,11 +34,15 @@ flowchart LR
 | 9. UI | `web/` | Next.js streaming chat with citations | ✅ Done |
 | 10. Evaluate | `eval/` | Retrieval, cheap generation-quality, and LLM-judge harnesses on a labeled gold set | 🟡 In progress |
 
-**Current status:** Full pipeline works end-to-end — ingest → embed → hybrid retrieve → LLM answer, exposed via FastAPI and a Next.js chat UI with token streaming. Three evaluation harnesses are in place (see [Evaluation](#evaluation)): retrieval quality, a cheap generation-quality harness (groundedness + citation), and a nuanced **LLM-judge rubric** (`gpt-5-mini`) that cross-checks the cheap signals. The remaining lever is generation faithfulness (abstain when sources are thin). See `progress.json` for details.
+**Current status:** Full pipeline works end-to-end — ingest → embed → hybrid retrieve → LLM answer, exposed via FastAPI and a Next.js chat UI with token streaming. Three evaluation harnesses are in place (see [Evaluation](#evaluation)): retrieval quality, a cheap generation-quality harness (groundedness + citation), and a nuanced **LLM-judge rubric** (`gpt-5-mini`) that cross-checks the cheap signals. The judge drove a tuning loop (prompt-faithfulness pass + `gpt-4.1` generator) that lifted overall answer quality from **3.43 → 4.01 / 5**; the open levers are citation precision and the production-generator cost decision. See `progress.json` for details.
 
 ---
 
 ## Architecture
+
+> 📐 **Full diagrams:** see [`docs/architecture.md`](docs/architecture.md) for editable Mermaid
+> diagrams — a system overview (indexing · serving · evaluation) and the detailed multi-query
+> retrieval flow (gated rewrite + RRF fusion). `docs/architecture.svg` is a static render.
 
 ```
 Browser (Next.js chat)            FastAPI (Python)               Services
@@ -120,6 +124,10 @@ Structured-RAG/
 ├── progress.json             # Stage-by-stage status (source of truth)
 ├── CLAUDE.md                 # Quick reference for the codebase
 ├── README.md                 # This file
+│
+├── docs/
+│   ├── architecture.md       # Mermaid diagrams: system overview + multi-query retrieval
+│   └── architecture.svg      # Static end-to-end render
 │
 ├── config/
 │   ├── default.yaml          # Global defaults (chunking, indexing, retrieval, generation)
@@ -424,7 +432,9 @@ privacy-as-a-fundamental-right content. Retrieval behaved correctly, but the LLM
 confidently **from its own training knowledge** — citing valid `[2][3]` markers that don't
 actually support the claim. `uncited_answer_rate` and citation-validity both pass; only
 **groundedness catches off-source embellishment**, doubling as a corpus-gap / hallucination
-detector. Tightening generation faithfulness (abstain when sources are thin) is the next lever.
+detector. Tightening generation faithfulness (abstain when sources are thin) was the next lever —
+pulled in the [LLM-as-judge](#llm-as-judge-nuanced-rubric--cross-checks-the-cheap-signals) section
+below, which quantifies it per-criterion and drove the 3.43 → 4.01 climb.
 
 ### LLM-as-judge (nuanced rubric — cross-checks the cheap signals)
 
@@ -440,43 +450,51 @@ self-preference is reduced, not eliminated). Because gpt-5 is a *reasoning* mode
 `temperature != 1`, the judge call omits `temperature` and passes `reasoning_effort` instead.
 
 ```powershell
-python scripts/evaluate_judge.py --rerank 8            # judge + cheap signals on the same answers
-python scripts/evaluate_judge.py --rerank 8 --limit 5  # sample a few (cost control)
+python scripts/evaluate_judge.py --rerank 8                     # judge + cheap signals on the same answers
+python scripts/evaluate_judge.py --rerank 8 --gen-model gpt-4.1 # override the generator for this run only
+python scripts/evaluate_judge.py --rerank 8 --limit 5           # sample a few (cost control)
 ```
 
-**Baseline snapshot** (30 questions, `rerank_top_k=8`, `gpt-5-mini`, 2026-07-01). Treat these as a
-*versioned baseline*, not a fixed grade — they will move as generation is tuned (faithfulness/
-citation are the open levers below), and the judge is intentionally strict, so the absolute numbers
-read lower than the cheap cosines:
+**Generator sweep** (30 questions, `rerank_top_k=8`, judge `gpt-5-mini`). The judge turned "the
+answers seem good" into an actual tuning loop — a prompt-faithfulness pass, then a generator
+upgrade, then two refinements — that moved **overall from 3.43 → 4.01 (crossing 4.0)**:
 
-| Judge criterion (1–5) | Mean | Cheap-signal counterpart |
-|-----------------------|:----:|--------------------------|
-| faithfulness | 3.37 | grounded_fraction 84 % |
-| completeness | 3.67 | — |
-| exam_appropriateness | 3.70 | — |
-| citation_quality | 3.00 | cited_fraction 33 % |
-| **overall** | **3.43 (69 %)** | — |
+| Generator · prompt | faithfulness | completeness | exam_approp. | citation | overall |
+|--------------------|:---:|:---:|:---:|:---:|:---:|
+| gpt-4o-mini · baseline | 3.37 | 3.67 | 3.70 | 3.00 | 3.43 (69 %) |
+| gpt-4o-mini · tightened prompt | 3.73 | 3.27 | 3.60 | 3.17 | 3.44 |
+| gpt-4.1 · tightened prompt | 3.57 | 4.23 | 4.40 | 3.20 | 3.85 |
+| **gpt-4.1 · + refinements** | **4.07** | **4.13** | **4.30** | **3.53** | **4.01 (80 %)** |
 
-**The finding is the correlation, not the score.** Per question, the cheap proxies track the judge
-only *weakly* (faithfulness ↔ grounded_fraction `r ≈ +0.26`, citation_quality ↔ cited_fraction
-`r ≈ +0.31` at n=30). So the cheap signals are a fine **always-on gate**, but **not a substitute**
-for the judge on faithfulness/citation nuance — which is exactly what the judge is for. Where they
-disagree is where the judge earns its keep:
+> The eval overrides the generator with `--gen-model gpt-4.1`; production `generation.model` stays
+> `gpt-4o-mini` until adopted. The prompt refinements are live in `generation/answer.py`.
 
-- **Cheap false-pass** — the *73rd-amendment* answer scored 92 % grounded but the judge gave
-  faithfulness **2/5**: it invented specifics (Gram Sabha = "all registered voters", "proportional"
-  reservation) not in the sources. The cosine's near-paraphrase check missed them.
-- **Misattributed citation** — the *self-incrimination* answer scored 71 % grounded but faithfulness
-  **1/5**: it cites an Article-19 source for Article-20(3) claims. Citation-*validity* passes (the
-  marker is a real source number); only the judge sees the source doesn't support the claim.
-- **Cheap false-negative** — the *DPSP-binding* answer scored just 38 % grounded (heavy paraphrase)
-  but the judge confirmed faithfulness **5/5**: the claims *are* supported, the cosine was overly
-  pessimistic.
+**What moved and why.** A stronger generator (`gpt-4.1`) lifted **completeness** (3.27 → 4.13) and
+**exam_appropriateness** (3.60 → 4.30) — the two criteria a small model was weakest on — but at
+first *dented* faithfulness because it confidently added true-but-unsourced specifics. Two
+refinements fixed that: a prompt rule against sharpening a source's general statement into a
+specific one, and raising the judge's per-source window (1.5k → 3k chars) so it stopped docking
+claims it simply couldn't see. Net: **faithfulness 3.57 → 4.07**, citation 3.20 → 3.53. **Three of
+four criteria now clear 4**; citation_quality (3.53) is the laggard, held down partly by corpus-gap
+questions that *should* score low (e.g. privacy — the 2011 book predates Puttaswamy).
 
-**Takeaway:** keep the cheap signals as the cheap gate on every answer, and reserve the judge for
-periodic deep checks and to audit the cheap signal's false-passes. The judge's main critique —
-off-source embellishment and loose citations — is the same **generation-faithfulness** lever the
-groundedness section flagged, now quantified per-criterion.
+**The cheap signals track the judge better as quality rises.** At the winning config the
+per-question correlations are the strongest measured: faithfulness ↔ grounded_fraction `r ≈ +0.47`,
+citation_quality ↔ cited_fraction `r ≈ +0.33` (both were near zero at the 3.43 baseline). Still,
+the cheap signals remain a **gate, not a substitute** — the judge is what catches:
+
+- **Misattributed citation** — the *HC-judge-removal* answer scored 100 % grounded but the judge
+  gave faithfulness **3/5**: it cites "Article 217" that isn't in the supplied sources. Citation
+  *validity* passes (a real marker); only the judge sees the source doesn't support the claim.
+- **Cheap false-negative** — the *DPSP-binding* answer scored ~40 % grounded (heavy paraphrase) but
+  the judge confirmed the claims **are** supported (5/5) — the cosine was overly pessimistic.
+- **Corpus-gap floor** — *privacy* scores low on both, correctly: the source lacks the content, so
+  the honest answer is to abstain; no generator fixes this.
+
+**Takeaway:** the judge is what let a vibe become a measured 3.43 → 4.01 climb. The remaining lever
+is **citation precision** (cite only the source that supports each claim), plus the product
+decision of whether the completeness/exam gains justify running `gpt-4.1` in production (~13× the
+per-answer cost of `gpt-4o-mini`, or `gpt-4.1-mini` at ~2×).
 
 ---
 
@@ -504,6 +522,8 @@ groundedness section flagged, now quantified per-criterion.
 - [x] Generation-quality eval — 3 cheap signals (article recall, citation, groundedness) — no LLM judge
 - [x] LangGraph orchestration backend (parallel path behind `UPSC_RAG_PIPELINE=graph`) + LangChain LLM portability seam
 - [x] LLM-judge rubric (faithfulness / completeness / exam-appropriateness / citation) cross-checked against the cheap signals (`gpt-5-mini`)
-- [ ] Generation faithfulness — abstain / qualify when sources are thin (the judge's main critique)
+- [x] Judge-driven tuning loop — prompt-faithfulness refinements + `gpt-4.1` generator lifted judge overall 3.43 → 4.01 (faithfulness 3.37 → 4.07)
+- [ ] Citation precision — cite only the source that supports each claim (judge citation_quality 3.53, the remaining laggard)
+- [ ] Adopt `gpt-4.1` (or `gpt-4.1-mini`) as the production generator if the completeness/exam gains justify the cost
 - [ ] Multi-book support in the UI (book selector)
 ```

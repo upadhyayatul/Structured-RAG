@@ -71,12 +71,15 @@ def main() -> None:
     parser.add_argument("--rerank", type=int, default=None, help="Sources to pass to the LLM")
     parser.add_argument("--limit", type=int, default=None, help="Score only the first N gold questions (cost / rate-limit control)")
     parser.add_argument("--gold", default=None, help="Path to gold jsonl (default data/eval/<book>.jsonl)")
+    parser.add_argument("--gen-model", default=None, help="Override the generation model for this run only (production config untouched)")
     parser.add_argument("--judge-model", default=None, help="OpenAI judge model (default from config)")
     parser.add_argument("--interval", type=float, default=None, help="Seconds to sleep between judge calls (free-tier TPM pacing; default from config)")
     args = parser.parse_args()
 
     settings = get_settings()
     cfg = load_runtime_config(args.book)
+    if args.gen_model:  # eval-only override; never written back to config/default.yaml
+        cfg.setdefault("generation", {})["model"] = args.gen_model
     gen_eval_cfg = cfg.get("eval", {}).get("generation", {})
     judge_cfg = cfg.get("eval", {}).get("judge", {})
     embed_model = gen_eval_cfg.get("embed_model", "text-embedding-3-small")

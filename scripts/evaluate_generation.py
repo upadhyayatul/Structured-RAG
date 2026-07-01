@@ -30,12 +30,15 @@ def main() -> None:
     parser.add_argument("--rerank", type=int, default=None, help="Sources to pass to the LLM")
     parser.add_argument("--limit", type=int, default=None, help="Score only the first N gold questions (cost control)")
     parser.add_argument("--gold", default=None, help="Path to gold jsonl (default data/eval/<book>.jsonl)")
+    parser.add_argument("--gen-model", default=None, help="Override the generation model for this run only (production config untouched)")
     parser.add_argument("--embed-model", default=None, help="Embedding model for groundedness/relevance")
     parser.add_argument("--ground-threshold", type=float, default=None, help="Cosine cutoff for a 'supported' sentence")
     args = parser.parse_args()
 
     settings = get_settings()
     cfg = load_runtime_config(args.book)
+    if args.gen_model:  # eval-only override; never written back to config/default.yaml
+        cfg.setdefault("generation", {})["model"] = args.gen_model
     eval_cfg = cfg.get("eval", {}).get("generation", {})
     embed_model = args.embed_model or eval_cfg.get("embed_model", "text-embedding-3-small")
     ground_threshold = args.ground_threshold if args.ground_threshold is not None else eval_cfg.get("ground_threshold", 0.5)
@@ -47,7 +50,7 @@ def main() -> None:
     if args.limit:
         gold = gold[: args.limit]
     print(f"Loaded {len(gold)} gold questions from {gold_path}")
-    print(f"Embed model: {embed_model}  |  ground_threshold: {ground_threshold}\n")
+    print(f"Generator: {cfg.get('generation', {}).get('model')}  |  embed model: {embed_model}  |  ground_threshold: {ground_threshold}\n")
 
     retriever = HybridRetriever(cfg, processed / "chunks.jsonl")
     floor = cfg.get("retrieval", {}).get("relevance_floor", 0.0)
