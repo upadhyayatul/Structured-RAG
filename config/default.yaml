@@ -51,6 +51,11 @@ generation:
   temperature: 0.2
   max_tokens: 1024
 
+conversation:                # multi-turn: resolve follow-ups against recent chat history
+  enabled: true              # condense follow-ups for retrieval + pass history to the answer LLM
+  history_turns: 3           # prior exchanges kept (N questions + N answers = 2N messages)
+  condense_model: gpt-4.1-nano   # cheap LLM that rewrites a follow-up into a standalone search query
+
 eval:
   generation:               # cheap generation-quality signals (scripts/evaluate_generation.py) — no LLM judge
     embed_model: text-embedding-3-small  # embedder for groundedness + answer-relevance cosines (cheap; separate from the 3-large corpus model)

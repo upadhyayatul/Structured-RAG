@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import os
 from contextlib import asynccontextmanager
-from typing import Any, Iterator
+from typing import Any, Iterator, Literal
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field
 
 from upsc_rag.config import get_settings, load_runtime_config
 from upsc_rag.generation.answer import generate_answer, generate_answer_stream
+from upsc_rag.generation.condense import condense_query
 from upsc_rag.generation.router import OUT_OF_SCOPE_REPLY, is_off_topic, smalltalk_reply
 from upsc_rag.generation.sources import build_source_dicts
 from upsc_rag.retrieval.hybrid import HybridRetriever
@@ -70,14 +71,46 @@ app.add_middleware(
 )
 
 
+class Turn(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str
+
+
 class AskRequest(BaseModel):
     query: str = Field(..., min_length=1, description="Natural-language question")
+    history: list[Turn] | None = Field(
+        default=None,
+        description="Prior conversation turns (recent first-to-last) for follow-up resolution",
+    )
     top_k: int | None = Field(default=None, description="Dense+BM25 candidate pool size")
     rerank_top_k: int | None = Field(default=None, description="Sources passed to the LLM")
     session_id: str | None = Field(
         default=None,
         description="Conversation id; groups this question's traces in Langfuse Sessions",
     )
+
+
+def _history_and_search_query(req: "AskRequest", cfg: dict[str, Any]) -> tuple[
+    list[dict[str, Any]] | None, str
+]:
+    """Resolve conversation history + the (possibly condensed) query used for retrieval.
+
+    Returns ``(history_dicts, search_query)``. When conversation is enabled and history
+    is present, the follow-up is condensed into a standalone search query; otherwise the
+    raw query is used and history is None. The raw ``req.query`` is always what the answer
+    LLM sees (with history) — condensing only affects retrieval.
+    """
+    conv_cfg = cfg.get("conversation", {})
+    if not (conv_cfg.get("enabled", True) and req.history):
+        return None, req.query
+    history = [t.model_dump() for t in req.history]
+    search_query = condense_query(
+        req.query,
+        history,
+        model=conv_cfg.get("condense_model", "gpt-4.1-nano"),
+        session_id=req.session_id,
+    )
+    return history, search_query
 
 
 class Source(BaseModel):
@@ -115,9 +148,10 @@ def ask(req: AskRequest) -> AskResponse:
     if USE_GRAPH:
         from upsc_rag.graph import run_ask
 
+        history = [t.model_dump() for t in req.history] if req.history else None
         final = run_ask(
             _state["graph"], req.query, top_k=req.top_k,
-            rerank_top_k=req.rerank_top_k, session_id=req.session_id,
+            rerank_top_k=req.rerank_top_k, session_id=req.session_id, history=history,
         )
         sources = [Source(**s) for s in final.get("sources", [])]
         return AskResponse(answer=final.get("answer", ""), sources=sources)
@@ -127,8 +161,10 @@ def ask(req: AskRequest) -> AskResponse:
     if canned is not None:
         return AskResponse(answer=canned, sources=[])
 
+    # Resolve follow-ups: condense history + query into a standalone retrieval query.
+    history, search_query = _history_and_search_query(req, _state["cfg"])
     results = retriever.retrieve(
-        req.query, top_k=req.top_k, rerank_top_k=req.rerank_top_k, session_id=req.session_id
+        search_query, top_k=req.top_k, rerank_top_k=req.rerank_top_k, session_id=req.session_id
     )
 
     # Gate 2: real question, but no relevant source in the book — skip generation.
@@ -136,7 +172,9 @@ def ask(req: AskRequest) -> AskResponse:
     if is_off_topic(results, floor):
         return AskResponse(answer=OUT_OF_SCOPE_REPLY, sources=[])
 
-    answer = generate_answer(req.query, results, _state["cfg"], session_id=req.session_id)
+    answer = generate_answer(
+        req.query, results, _state["cfg"], session_id=req.session_id, history=history
+    )
     return AskResponse(answer=answer, sources=_build_sources(results))
 
 
@@ -162,14 +200,18 @@ def ask_stream(req: AskRequest) -> StreamingResponse:
             {"type": "done", "cost_usd": 0.0, "input_tokens": 0, "output_tokens": 0}
         ) + "\n"
 
+    # History for the answer LLM; set below for both graph and direct paths.
+    history: list[dict[str, Any]] | None
+
     # Graph mode: run the smalltalk → retrieve → gate prefix through the graph nodes,
     # then stream tokens below exactly as the direct path does (same NDJSON contract).
     if USE_GRAPH:
         from upsc_rag.graph import prepare_stream
 
+        history = [t.model_dump() for t in req.history] if req.history else None
         prep = prepare_stream(
             retriever, _state["cfg"], req.query, top_k=req.top_k,
-            rerank_top_k=req.rerank_top_k, session_id=req.session_id,
+            rerank_top_k=req.rerank_top_k, session_id=req.session_id, history=history,
         )
         if prep["route"] != "answer":
             return StreamingResponse(
@@ -182,8 +224,10 @@ def ask_stream(req: AskRequest) -> StreamingResponse:
         if canned is not None:
             return StreamingResponse(canned_stream(canned), media_type="application/x-ndjson")
 
+        # Resolve follow-ups: condense history + query into a standalone retrieval query.
+        history, search_query = _history_and_search_query(req, _state["cfg"])
         results = retriever.retrieve(
-            req.query, top_k=req.top_k, rerank_top_k=req.rerank_top_k, session_id=req.session_id
+            search_query, top_k=req.top_k, rerank_top_k=req.rerank_top_k, session_id=req.session_id
         )
 
         # Gate 2: real question, but no relevant source in the book — skip generation.
@@ -201,7 +245,8 @@ def ask_stream(req: AskRequest) -> StreamingResponse:
         # usage_sink is filled with token counts + estimated cost once the stream ends.
         usage_sink: dict[str, Any] = {}
         for delta in generate_answer_stream(
-            req.query, results, _state["cfg"], session_id=req.session_id, usage_sink=usage_sink
+            req.query, results, _state["cfg"], session_id=req.session_id,
+            usage_sink=usage_sink, history=history,
         ):
             yield json.dumps({"type": "token", "text": delta}) + "\n"
         yield json.dumps({

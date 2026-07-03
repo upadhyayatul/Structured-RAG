@@ -17,6 +17,7 @@ Route = Literal["smalltalk", "off_topic", "answer"]
 class AskState(TypedDict, total=False):
     # --- inputs ---
     query: str
+    history: list[dict[str, Any]] | None  # prior {role, content} turns for follow-up resolution
     top_k: int | None
     rerank_top_k: int | None
     session_id: str | None

@@ -20,13 +20,16 @@ export async function POST(req: NextRequest) {
   // Conversation id from the client; forwarded so the backend can group this
   // question's retrieve + answer traces under one Langfuse Session.
   const sessionId = (body as { sessionId?: string })?.sessionId;
+  // Recent conversation turns for follow-up resolution; forwarded as-is (the
+  // backend condenses them for retrieval and passes them to the answer LLM).
+  const history = (body as { history?: unknown })?.history;
 
   let upstream: Response;
   try {
     upstream = await fetch(`${BACKEND_URL}/ask/stream`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ query, rerank_top_k: 6, session_id: sessionId }),
+      body: JSON.stringify({ query, history, rerank_top_k: 6, session_id: sessionId }),
     });
   } catch {
     return NextResponse.json(

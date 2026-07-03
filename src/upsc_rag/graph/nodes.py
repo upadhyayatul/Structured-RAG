@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import Any, Callable
 
 from upsc_rag.generation.answer import generate_answer
+from upsc_rag.generation.condense import condense_query
 from upsc_rag.generation.router import (
     OUT_OF_SCOPE_REPLY,
     is_off_topic,
@@ -36,12 +37,26 @@ def make_smalltalk_node() -> Node:
     return smalltalk_node
 
 
-def make_retrieve_node(retriever: HybridRetriever) -> Node:
-    """Run hybrid retrieval; stash raw results for the gate + generate nodes."""
+def make_retrieve_node(retriever: HybridRetriever, cfg: dict[str, Any]) -> Node:
+    """Run hybrid retrieval; stash raw results for the gate + generate nodes.
+
+    When conversation history is present, the follow-up is first condensed into a
+    standalone search query (retrieval only — the raw query still drives generation).
+    """
+    conv_cfg = cfg.get("conversation", {})
 
     def retrieve_node(state: AskState) -> dict[str, Any]:
+        search_query = state["query"]
+        history = state.get("history")
+        if conv_cfg.get("enabled", True) and history:
+            search_query = condense_query(
+                state["query"],
+                history,
+                model=conv_cfg.get("condense_model", "gpt-4.1-nano"),
+                session_id=state.get("session_id"),
+            )
         results = retriever.retrieve(
-            state["query"],
+            search_query,
             top_k=state.get("top_k"),
             rerank_top_k=state.get("rerank_top_k"),
             session_id=state.get("session_id"),
@@ -69,9 +84,10 @@ def make_generate_node(cfg: dict[str, Any]) -> Node:
 
     def generate_node(state: AskState) -> dict[str, Any]:
         results = state.get("results") or []
+        history = state.get("history")
         usage_sink: dict[str, Any] = {}
         if langchain_backend_enabled():
-            answer = _generate_langchain(state["query"], results, cfg, usage_sink)
+            answer = _generate_langchain(state["query"], results, cfg, usage_sink, history)
         else:
             answer = generate_answer(
                 state["query"],
@@ -79,6 +95,7 @@ def make_generate_node(cfg: dict[str, Any]) -> Node:
                 cfg,
                 session_id=state.get("session_id"),
                 usage_sink=usage_sink,
+                history=history,
             )
         return {
             "answer": answer,
@@ -94,18 +111,26 @@ def _generate_langchain(
     results: list[dict[str, Any]],
     cfg: dict[str, Any],
     usage_sink: dict[str, Any],
+    history: list[dict[str, Any]] | None = None,
 ) -> str:
     """ChatOpenAI variant of generate_answer (portability seam, off by default).
 
     Reuses the exact same system + user prompts as the OpenAI-SDK path so the answer is
     equivalent; fills ``usage_sink`` from LangChain's usage metadata.
     """
-    from upsc_rag.generation.answer import _SYSTEM_PROMPT, build_answer_prompt, estimate_cost
+    from upsc_rag.generation.answer import (
+        _SYSTEM_PROMPT,
+        _history_messages,
+        build_answer_prompt,
+        estimate_cost,
+    )
     from upsc_rag.llm.clients import get_chat_model
 
     model = get_chat_model(cfg)
+    hist = _history_messages(history, cfg.get("conversation", {}).get("history_turns", 3))
     messages = [
         ("system", _SYSTEM_PROMPT),
+        *[(m["role"], m["content"]) for m in hist],
         ("human", build_answer_prompt(query, results)),
     ]
     resp = model.invoke(messages)

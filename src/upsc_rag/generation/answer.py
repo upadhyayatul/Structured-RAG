@@ -70,8 +70,26 @@ _SYSTEM_PROMPT = (
     "claim. Open with a one-sentence direct answer that names the relevant Article(s) "
     "in **bold** (with its source citation). Then use Markdown structure: short `##` "
     "headings to group ideas, bullet points, and **bold** the key operative terms. "
-    "End with notable exceptions or conditions if the sources mention any."
+    "End with notable exceptions or conditions if the sources mention any.\n\n"
+    "Earlier conversation turns may be provided before the current question — use them "
+    "ONLY to understand what the current question refers to (e.g. to resolve pronouns "
+    "like 'it' or 'they'). Still answer only the current question, grounded solely in "
+    "the sources supplied for it, and cite those sources as instructed above."
 )
+
+
+def _history_messages(
+    history: list[dict[str, Any]] | None, history_turns: int
+) -> list[dict[str, str]]:
+    """Windowed prior turns as chat messages: last ``history_turns`` exchanges (2N msgs)."""
+    if not history:
+        return []
+    turns = [
+        {"role": t["role"], "content": (t.get("content") or "").strip()}
+        for t in history
+        if t.get("role") in ("user", "assistant") and (t.get("content") or "").strip()
+    ]
+    return turns[-history_turns * 2:] if history_turns > 0 else turns
 
 
 def build_answer_prompt(query: str, contexts: list[dict[str, Any]]) -> str:
@@ -114,26 +132,31 @@ def generate_answer(
     client: OpenAI | None = None,
     session_id: str | None = None,
     usage_sink: dict[str, Any] | None = None,
+    history: list[dict[str, Any]] | None = None,
 ) -> str:
     """
     Build the grounded prompt and call the LLM to produce a cited answer.
 
     Reads model/temperature/max_tokens from cfg["generation"]. Pass `client`
     to reuse an existing OpenAI instance; otherwise one is built from
-    OPENAI_API_KEY in the environment.
+    OPENAI_API_KEY in the environment. `history` (prior {role, content} turns) is
+    windowed via cfg["conversation"] and inserted before the current question so
+    the model can resolve follow-up references.
     """
     gen_cfg = cfg.get("generation", {})
     client = client or OpenAI(api_key=os.environ["OPENAI_API_KEY"])
     model = gen_cfg.get("model", "gpt-4o-mini")
     prompt = build_answer_prompt(query, contexts)
+    hist = _history_messages(history, cfg.get("conversation", {}).get("history_turns", 3))
     messages = [
         {"role": "system", "content": _SYSTEM_PROMPT},
+        *hist,
         {"role": "user", "content": prompt},
     ]
 
     with trace_manager.trace(
         "answer",
-        input={"query": query, "num_sources": len(contexts)},
+        input={"query": query, "num_sources": len(contexts), "num_history": len(hist)},
         session_id=session_id,
     ) as trace:
         gen = trace.generation(
@@ -166,19 +189,26 @@ def generate_answer_stream(
     client: OpenAI | None = None,
     session_id: str | None = None,
     usage_sink: dict[str, Any] | None = None,
+    history: list[dict[str, Any]] | None = None,
 ) -> Iterator[str]:
-    """Yield the answer text incrementally as the LLM streams tokens."""
+    """Yield the answer text incrementally as the LLM streams tokens.
+
+    `history` (prior {role, content} turns) is windowed via cfg["conversation"] and
+    inserted before the current question so the model can resolve follow-up references.
+    """
     gen_cfg = cfg.get("generation", {})
     client = client or OpenAI(api_key=os.environ["OPENAI_API_KEY"])
     model = gen_cfg.get("model", "gpt-4o-mini")
+    hist = _history_messages(history, cfg.get("conversation", {}).get("history_turns", 3))
     messages = [
         {"role": "system", "content": _SYSTEM_PROMPT},
+        *hist,
         {"role": "user", "content": build_answer_prompt(query, contexts)},
     ]
 
     with trace_manager.trace(
         "answer",
-        input={"query": query, "num_sources": len(contexts)},
+        input={"query": query, "num_sources": len(contexts), "num_history": len(hist)},
         session_id=session_id,
     ) as trace:
         gen = trace.generation(

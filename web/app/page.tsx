@@ -8,6 +8,7 @@ import type { Source } from "@/app/types";
 interface ChatMessage {
   role: "user" | "assistant";
   content: string;
+  quote?: string; // excerpt this user question was asked "about" (reply-style)
   sources?: Source[];
   ttftMs?: number;
   costUsd?: number;
@@ -16,12 +17,25 @@ interface ChatMessage {
   error?: boolean;
 }
 
+// A live text selection inside an assistant answer, plus where to float the button.
+interface AnswerSelection {
+  text: string;
+  x: number; // viewport px, horizontal center of the selection
+  y: number; // viewport px, top of the selection
+}
+
 export default function Home() {
   const [dark, setDark] = useState(true);
   const [input, setInput] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [loading, setLoading] = useState(false);
+  // Pending reply-quote (excerpt the user picked "Ask about this" on), shown above the input.
+  const [quote, setQuote] = useState<string | null>(null);
+  // Live selection inside an answer → drives the floating "Ask about this" button.
+  const [selection, setSelection] = useState<AnswerSelection | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
   // One stable id per page load = one conversation = one Langfuse Session.
   const sessionId = useRef<string>(crypto.randomUUID());
 
@@ -33,6 +47,47 @@ export default function Home() {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
+  // Detect a text selection made INSIDE an assistant answer (marked data-answer),
+  // and remember it so we can float an "Ask about this" button near it.
+  useEffect(() => {
+    function onMouseUp() {
+      const sel = window.getSelection();
+      const text = sel?.toString().trim() ?? "";
+      if (!sel || sel.isCollapsed || !text) {
+        setSelection(null);
+        return;
+      }
+      const anchor = sel.anchorNode;
+      const el = anchor instanceof Element ? anchor : anchor?.parentElement;
+      if (!el?.closest("[data-answer]")) {
+        setSelection(null); // selection outside an answer (user bubble, sources, input)
+        return;
+      }
+      const rect = sel.getRangeAt(0).getBoundingClientRect();
+      setSelection({ text, x: rect.left + rect.width / 2, y: rect.top });
+    }
+    document.addEventListener("mouseup", onMouseUp);
+    return () => document.removeEventListener("mouseup", onMouseUp);
+  }, []);
+
+  // The floating button is anchored to viewport coords, so hide it once the user scrolls.
+  useEffect(() => {
+    const node = scrollRef.current;
+    if (!node) return;
+    const hide = () => setSelection(null);
+    node.addEventListener("scroll", hide);
+    return () => node.removeEventListener("scroll", hide);
+  }, []);
+
+  // Promote the live selection to a pending reply-quote and focus the input.
+  function askAboutSelection() {
+    if (!selection) return;
+    setQuote(selection.text);
+    setSelection(null);
+    window.getSelection()?.removeAllRanges();
+    inputRef.current?.focus();
+  }
+
   // Patch the most recent message in place (used while streaming).
   function patchLast(patch: Partial<ChatMessage>) {
     setMessages((m) => {
@@ -42,17 +97,37 @@ export default function Home() {
     });
   }
 
-  async function send(e: React.FormEvent) {
+  function send(e: React.FormEvent) {
     e.preventDefault();
-    const q = input.trim();
+    submitQuery(input.trim());
+  }
+
+  async function submitQuery(q: string) {
     if (!q || loading) return;
+
+    // If a passage was quoted, fold it into the query the backend sees so the
+    // follow-up's retrieval + answer take the excerpt into account; keep `quote`
+    // on the message separately so the UI can show it reply-style.
+    const activeQuote = quote;
+    const backendQuery = activeQuote
+      ? `Regarding this excerpt from the previous answer:\n"${activeQuote}"\n\n${q}`
+      : q;
+
+    // Recent conversation for follow-up resolution: only completed turns, last N
+    // exchanges (N questions + N answers), stripped to {role, content}. `messages`
+    // here still holds the prior conversation (the new turn is appended below).
+    const history = messages
+      .filter((m) => !m.streaming && !m.error && m.content)
+      .map((m) => ({ role: m.role, content: m.content }))
+      .slice(-HISTORY_EXCHANGES * 2);
 
     setMessages((m) => [
       ...m,
-      { role: "user", content: q },
+      { role: "user", content: q, quote: activeQuote ?? undefined },
       { role: "assistant", content: "", streaming: true },
     ]);
     setInput("");
+    setQuote(null);
     setLoading(true);
 
     const start = performance.now();
@@ -63,7 +138,7 @@ export default function Home() {
       const res = await fetch("/api/ask", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query: q, sessionId: sessionId.current }),
+        body: JSON.stringify({ query: backendQuery, history, sessionId: sessionId.current }),
       });
 
       if (!res.ok || !res.body) {
@@ -131,7 +206,7 @@ export default function Home() {
         </a>
       </div>
 
-      <div className="flex-1 overflow-y-auto">
+      <div ref={scrollRef} className="flex-1 overflow-y-auto">
         <div className="mx-auto w-full max-w-3xl px-4 pb-6">
           <header className="py-8 text-center">
             <h1 className="text-3xl font-bold">UPSC Polity Chat</h1>
@@ -140,10 +215,12 @@ export default function Home() {
             </p>
           </header>
 
+          {messages.length === 0 && <SampleQuestions onPick={submitQuery} />}
+
           <div className="flex flex-col gap-6">
             {messages.map((m, i) =>
               m.role === "user" ? (
-                <UserBubble key={i} text={m.content} />
+                <UserBubble key={i} text={m.content} quote={m.quote} />
               ) : (
                 <AssistantMessage key={i} message={m} />
               ),
@@ -154,31 +231,113 @@ export default function Home() {
       </div>
 
       <div className="border-t border-neutral-200 dark:border-neutral-800">
-        <form onSubmit={send} className="mx-auto flex w-full max-w-3xl items-center gap-2 px-4 py-4">
-          <input
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            placeholder="Send a message…"
-            className="flex-1 rounded-lg border border-neutral-300 bg-transparent px-4 py-3 text-sm outline-none focus:border-neutral-500 dark:border-neutral-700"
-          />
+        <div className="mx-auto w-full max-w-3xl px-4">
+          {quote && <ReplyPreview quote={quote} onClear={() => setQuote(null)} />}
+          <form onSubmit={send} className="flex w-full items-center gap-2 py-4">
+            <input
+              ref={inputRef}
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              placeholder={quote ? "Ask about the quoted text…" : "Send a message…"}
+              className="flex-1 rounded-lg border border-neutral-300 bg-transparent px-4 py-3 text-sm outline-none focus:border-neutral-500 dark:border-neutral-700"
+            />
+            <button
+              type="submit"
+              disabled={loading || !input.trim()}
+              aria-label="Send"
+              className="rounded-lg border border-neutral-300 p-3 text-neutral-600 hover:bg-neutral-100 disabled:opacity-40 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-900"
+            >
+              <SendIcon />
+            </button>
+          </form>
+        </div>
+      </div>
+
+      {selection && (
+        <button
+          // preventDefault on mousedown keeps the text selection alive through the click.
+          onMouseDown={(e) => {
+            e.preventDefault();
+            askAboutSelection();
+          }}
+          style={{
+            position: "fixed",
+            top: Math.max(8, selection.y - 40),
+            left: selection.x,
+            transform: "translateX(-50%)",
+          }}
+          className="z-50 flex items-center gap-1.5 rounded-full border border-neutral-300 bg-white px-3 py-1.5 text-xs font-medium text-neutral-700 shadow-lg hover:bg-neutral-100 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-200 dark:hover:bg-neutral-800"
+        >
+          <QuoteIcon />
+          Ask about this
+        </button>
+      )}
+    </div>
+  );
+}
+
+// How many recent exchanges (question + answer pairs) to send as conversation
+// context for follow-up resolution. Keep in sync with `conversation.history_turns`
+// in config/default.yaml.
+const HISTORY_EXCHANGES = 3;
+
+// Tappable starter prompts shown on the empty startup state to cue users on what to ask.
+const SAMPLE_QUESTIONS = [
+  "What is the difference between Fundamental Rights and Directive Principles?",
+  "Explain the powers of the President of India.",
+  "How is the Prime Minister of India appointed?",
+  "What are the key features of Indian federalism?",
+];
+
+function SampleQuestions({ onPick }: { onPick: (q: string) => void }) {
+  return (
+    <div className="mb-2">
+      <p className="mb-3 text-center text-xs uppercase tracking-wide text-neutral-400">
+        Try asking
+      </p>
+      <div className="flex flex-wrap justify-center gap-2">
+        {SAMPLE_QUESTIONS.map((q) => (
           <button
-            type="submit"
-            disabled={loading || !input.trim()}
-            aria-label="Send"
-            className="rounded-lg border border-neutral-300 p-3 text-neutral-600 hover:bg-neutral-100 disabled:opacity-40 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-900"
+            key={q}
+            type="button"
+            onClick={() => onPick(q)}
+            className="rounded-full border border-neutral-300 px-4 py-2 text-left text-sm text-neutral-700 transition-colors hover:border-neutral-500 hover:bg-neutral-100 dark:border-neutral-700 dark:text-neutral-300 dark:hover:border-neutral-500 dark:hover:bg-neutral-900"
           >
-            <SendIcon />
+            {q}
           </button>
-        </form>
+        ))}
       </div>
     </div>
   );
 }
 
-function UserBubble({ text }: { text: string }) {
+// WhatsApp-style reply preview: the quoted excerpt pinned above the input, with a clear button.
+function ReplyPreview({ quote, onClear }: { quote: string; onClear: () => void }) {
+  return (
+    <div className="mt-3 flex items-start gap-2 rounded-lg border-l-2 border-neutral-400 bg-neutral-100 px-3 py-2 dark:border-neutral-500 dark:bg-neutral-900">
+      <QuoteIcon />
+      <p className="line-clamp-2 flex-1 text-xs text-neutral-600 dark:text-neutral-400">{quote}</p>
+      <button
+        type="button"
+        onClick={onClear}
+        aria-label="Remove quote"
+        className="text-neutral-400 hover:text-neutral-700 dark:hover:text-neutral-200"
+      >
+        <CloseIcon />
+      </button>
+    </div>
+  );
+}
+
+function UserBubble({ text, quote }: { text: string; quote?: string }) {
   return (
     <div className="flex justify-end">
       <div className="max-w-[80%] rounded-2xl bg-neutral-900 px-4 py-2.5 text-sm text-white dark:bg-white dark:text-black">
+        {quote && (
+          <div className="mb-1.5 line-clamp-3 border-l-2 border-white/40 pl-2 text-xs italic opacity-70 dark:border-black/40">
+            {quote}
+          </div>
+        )}
         {text}
       </div>
     </div>
@@ -225,7 +384,7 @@ function AssistantMessage({ message }: { message: ChatMessage }) {
           <Spinner /> Thinking…
         </div>
       ) : (
-        <div className="markdown text-sm leading-relaxed text-foreground">
+        <div data-answer className="markdown text-sm leading-relaxed text-foreground">
           <ReactMarkdown remarkPlugins={[remarkGfm]} components={MD}>
             {message.content}
           </ReactMarkdown>
@@ -308,6 +467,22 @@ function SendIcon() {
     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
       <path d="m22 2-7 20-4-9-9-4Z" />
       <path d="M22 2 11 13" />
+    </svg>
+  );
+}
+
+function QuoteIcon() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" className="shrink-0 opacity-70">
+      <path d="M7 7h4v6a4 4 0 0 1-4 4H6v-2h1a2 2 0 0 0 2-2v-1H7Zm8 0h4v6a4 4 0 0 1-4 4h-1v-2h1a2 2 0 0 0 2-2v-1h-2Z" />
+    </svg>
+  );
+}
+
+function CloseIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M18 6 6 18M6 6l12 12" />
     </svg>
   );
 }

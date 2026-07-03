@@ -20,10 +20,12 @@ def run_ask(
     top_k: int | None = None,
     rerank_top_k: int | None = None,
     session_id: str | None = None,
+    history: list[dict[str, Any]] | None = None,
 ) -> AskState:
     """Invoke the compiled graph and return the final state (answer + sources + usage)."""
     initial: AskState = {
         "query": query,
+        "history": history,
         "top_k": top_k,
         "rerank_top_k": rerank_top_k,
         "session_id": session_id,
@@ -38,6 +40,7 @@ def prepare_stream(
     top_k: int | None = None,
     rerank_top_k: int | None = None,
     session_id: str | None = None,
+    history: list[dict[str, Any]] | None = None,
 ) -> AskState:
     """Run the smalltalk → retrieve → gate prefix; leave token generation to the caller.
 
@@ -47,6 +50,7 @@ def prepare_stream(
     """
     state: AskState = {
         "query": query,
+        "history": history,
         "top_k": top_k,
         "rerank_top_k": rerank_top_k,
         "session_id": session_id,
@@ -56,6 +60,6 @@ def prepare_stream(
     if state["route"] == "smalltalk":
         return state
 
-    state.update(make_retrieve_node(retriever)(state))
+    state.update(make_retrieve_node(retriever, cfg)(state))
     state.update(make_gate_node(cfg)(state))
     return state

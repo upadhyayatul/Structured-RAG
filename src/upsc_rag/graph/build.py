@@ -27,7 +27,7 @@ def build_ask_graph(retriever: HybridRetriever, cfg: dict[str, Any]):
     """Wire and compile the ask pipeline graph for one (retriever, cfg) pair."""
     g = StateGraph(AskState)
     g.add_node("smalltalk", make_smalltalk_node())
-    g.add_node("retrieve", make_retrieve_node(retriever))
+    g.add_node("retrieve", make_retrieve_node(retriever, cfg))
     g.add_node("gate", make_gate_node(cfg))
     g.add_node("generate", make_generate_node(cfg))
 
