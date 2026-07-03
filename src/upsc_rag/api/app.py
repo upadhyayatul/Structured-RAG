@@ -23,18 +23,25 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from upsc_rag.config import get_settings, load_runtime_config
-from upsc_rag.generation.answer import generate_answer, generate_answer_stream
+from upsc_rag.generation.answer import (
+    generate_agentic_answer_stream,
+    generate_answer,
+    generate_answer_stream,
+)
 from upsc_rag.generation.condense import condense_query
 from upsc_rag.generation.router import OUT_OF_SCOPE_REPLY, is_off_topic, smalltalk_reply
-from upsc_rag.generation.sources import build_source_dicts
+from upsc_rag.generation.sources import build_agentic_sources, build_source_dicts
 from upsc_rag.retrieval.hybrid import HybridRetriever
 
 # Default book served by the API; override with UPSC_RAG_BOOK env var.
 BOOK_ID = os.environ.get("UPSC_RAG_BOOK", "laxmikanth_6")
 
-# Orchestration backend: "graph" routes /ask + /ask/stream through the LangGraph
-# pipeline (built once in lifespan); anything else uses the direct path (default).
-USE_GRAPH = os.environ.get("UPSC_RAG_PIPELINE", "").lower() == "graph"
+# Orchestration backend (UPSC_RAG_PIPELINE): "graph" routes through the linear LangGraph
+# pipeline; "agentic" routes through the tool-calling agent (textbook + web search);
+# anything else uses the direct path (default). All three are built once in lifespan.
+_PIPELINE = os.environ.get("UPSC_RAG_PIPELINE", "").lower()
+USE_GRAPH = _PIPELINE == "graph"
+USE_AGENTIC = _PIPELINE == "agentic"
 
 # Populated at startup, reused across requests.
 _state: dict[str, Any] = {}
@@ -49,11 +56,15 @@ async def lifespan(app: FastAPI):
     _state["cfg"] = cfg
     retriever = HybridRetriever(cfg, chunks_path)
     _state["retriever"] = retriever
-    # Build the LangGraph pipeline once if graph mode is selected (reused per request).
+    # Build the selected orchestration graph once (reused per request).
     if USE_GRAPH:
         from upsc_rag.graph import build_ask_graph
 
         _state["graph"] = build_ask_graph(retriever, cfg)
+    elif USE_AGENTIC:
+        from upsc_rag.agent import build_agentic_graph
+
+        _state["graph"] = build_agentic_graph(retriever, cfg)
     yield
     _state.clear()
 
@@ -114,11 +125,22 @@ def _history_and_search_query(req: "AskRequest", cfg: dict[str, Any]) -> tuple[
 
 
 class Source(BaseModel):
+    """A citable source — either a textbook section (``type="book"``) or a web result
+    (``type="web"``). Book fields (section_path/chapter_title/pages) and web fields
+    (title/url/snippet) are both optional so the one model carries both kinds; the
+    agentic path returns a mix, the direct/graph paths return only book sources."""
+
     n: int
-    section_path: list[str]
-    chapter_title: str
-    page_start: int | None
-    page_end: int | None
+    type: str = "book"
+    # book source
+    section_path: list[str] | None = None
+    chapter_title: str | None = None
+    page_start: int | None = None
+    page_end: int | None = None
+    # web source
+    title: str | None = None
+    url: str | None = None
+    snippet: str | None = None
 
 
 class AskResponse(BaseModel):
@@ -144,9 +166,12 @@ def ask(req: AskRequest) -> AskResponse:
     if retriever is None:
         raise HTTPException(status_code=503, detail="Retriever not ready")
 
-    # Graph mode: the LangGraph pipeline runs the same gates + retrieve + generate.
-    if USE_GRAPH:
-        from upsc_rag.graph import run_ask
+    # Graph / agentic mode: the compiled pipeline runs the gates + retrieve + generate.
+    if USE_GRAPH or USE_AGENTIC:
+        if USE_AGENTIC:
+            from upsc_rag.agent import run_ask
+        else:
+            from upsc_rag.graph import run_ask
 
         history = [t.model_dump() for t in req.history] if req.history else None
         final = run_ask(
@@ -202,6 +227,45 @@ def ask_stream(req: AskRequest) -> StreamingResponse:
 
     # History for the answer LLM; set below for both graph and direct paths.
     history: list[dict[str, Any]] | None
+
+    # Agentic mode: run the smalltalk → domain gate → agent⇄tools loop to gather
+    # textbook + web sources, then stream the final synthesis (its own generator +
+    # combined source shape). Kept separate from the book-only graph/direct flow below.
+    if USE_AGENTIC:
+        from upsc_rag.agent import prepare_stream as agentic_prepare_stream
+
+        history = [t.model_dump() for t in req.history] if req.history else None
+        prep = agentic_prepare_stream(
+            retriever, _state["cfg"], req.query, top_k=req.top_k,
+            rerank_top_k=req.rerank_top_k, session_id=req.session_id, history=history,
+        )
+        if prep.get("route") != "answer":
+            return StreamingResponse(
+                canned_stream(prep["answer"]), media_type="application/x-ndjson"
+            )
+
+        contexts = prep.get("contexts") or []
+        web = prep.get("web") or []
+        sources = [Source(**s) for s in build_agentic_sources(contexts, web)]
+
+        def agentic_event_stream() -> Iterator[str]:
+            yield json.dumps(
+                {"type": "sources", "sources": [s.model_dump() for s in sources]}
+            ) + "\n"
+            usage_sink: dict[str, Any] = {}
+            for delta in generate_agentic_answer_stream(
+                req.query, contexts, web, _state["cfg"],
+                session_id=req.session_id, usage_sink=usage_sink, history=history,
+            ):
+                yield json.dumps({"type": "token", "text": delta}) + "\n"
+            yield json.dumps({
+                "type": "done",
+                "cost_usd": usage_sink.get("cost_usd", 0.0),
+                "input_tokens": usage_sink.get("input_tokens", 0),
+                "output_tokens": usage_sink.get("output_tokens", 0),
+            }) + "\n"
+
+        return StreamingResponse(agentic_event_stream(), media_type="application/x-ndjson")
 
     # Graph mode: run the smalltalk → retrieve → gate prefix through the graph nodes,
     # then stream tokens below exactly as the direct path does (same NDJSON contract).

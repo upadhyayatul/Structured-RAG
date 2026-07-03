@@ -346,6 +346,7 @@ function UserBubble({ text, quote }: { text: string; quote?: string }) {
 
 function AssistantMessage({ message }: { message: ChatMessage }) {
   const waiting = message.streaming && !message.content;
+  const provenance = answerProvenance(message);
 
   if (message.error) {
     return (
@@ -391,22 +392,39 @@ function AssistantMessage({ message }: { message: ChatMessage }) {
         </div>
       )}
 
+      {!message.streaming && provenance && <ProvenanceBadge provenance={provenance} />}
+
       {message.sources && message.sources.length > 0 && (
         <div className="space-y-1 border-l-2 border-neutral-200 pl-3 text-xs text-neutral-500 dark:border-neutral-800">
           <div className="font-semibold uppercase tracking-wide">Sources</div>
           <ol className="space-y-0.5">
-            {message.sources.map((s) => (
-              <li key={s.n}>
-                <span className="text-neutral-400">[{s.n}]</span>{" "}
-                {s.section_path.join(" › ") || s.chapter_title}
-                {s.page_start != null && (
-                  <span className="text-neutral-400">
-                    {" "}· p.{s.page_start}
-                    {s.page_end != null && s.page_end !== s.page_start ? `–${s.page_end}` : ""}
-                  </span>
-                )}
-              </li>
-            ))}
+            {message.sources.map((s) =>
+              s.type === "web" ? (
+                <li key={s.n}>
+                  <span className="text-neutral-400">[{s.n}]</span>{" "}
+                  <a
+                    href={s.url ?? undefined}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="text-blue-600 hover:underline dark:text-blue-400"
+                  >
+                    {s.title || s.url}
+                  </a>
+                  <span className="text-neutral-400"> · web</span>
+                </li>
+              ) : (
+                <li key={s.n}>
+                  <span className="text-neutral-400">[{s.n}]</span>{" "}
+                  {(s.section_path ?? []).join(" › ") || s.chapter_title}
+                  {s.page_start != null && (
+                    <span className="text-neutral-400">
+                      {" "}· p.{s.page_start}
+                      {s.page_end != null && s.page_end !== s.page_start ? `–${s.page_end}` : ""}
+                    </span>
+                  )}
+                </li>
+              )
+            )}
           </ol>
         </div>
       )}
@@ -420,6 +438,54 @@ function formatCost(usd: number): string {
   if (usd <= 0) return "$0.00";
   if (usd >= 0.01) return `$${usd.toFixed(2)}`;
   return `$${usd.toPrecision(2)}`;
+}
+
+// Where the answer actually drew from, based on the sources it CITED ([n] markers) —
+// not merely what was retrieved. Falls back to all supplied sources if the answer has
+// no citation markers. Returns null when there are no sources (smalltalk / off-topic).
+type Provenance = "book" | "web" | "mixed";
+
+function answerProvenance(message: ChatMessage): Provenance | null {
+  const sources = message.sources;
+  if (!sources || sources.length === 0) return null;
+  const cited = new Set(
+    [...message.content.matchAll(/\[(\d+)\]/g)].map((m) => Number(m[1])),
+  );
+  const relevant = cited.size > 0 ? sources.filter((s) => cited.has(s.n)) : sources;
+  const scope = relevant.length > 0 ? relevant : sources;
+  const hasWeb = scope.some((s) => s.type === "web");
+  const hasBook = scope.some((s) => s.type !== "web"); // undefined type = book
+  if (hasWeb && hasBook) return "mixed";
+  if (hasWeb) return "web";
+  return "book";
+}
+
+const PROVENANCE_META: Record<Provenance, { label: string; className: string }> = {
+  book: {
+    label: "From the textbook",
+    className:
+      "bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300",
+  },
+  web: {
+    label: "From the web",
+    className: "bg-blue-100 text-blue-700 dark:bg-blue-500/15 dark:text-blue-300",
+  },
+  mixed: {
+    label: "Textbook + web",
+    className:
+      "bg-purple-100 text-purple-700 dark:bg-purple-500/15 dark:text-purple-300",
+  },
+};
+
+function ProvenanceBadge({ provenance }: { provenance: Provenance }) {
+  const { label, className } = PROVENANCE_META[provenance];
+  return (
+    <span
+      className={`inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium ${className}`}
+    >
+      {label}
+    </span>
+  );
 }
 
 // Markdown element styling (no typography plugin needed).

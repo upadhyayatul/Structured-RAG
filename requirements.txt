@@ -11,7 +11,8 @@ snowballstemmer>=2.2
 flashrank>=0.2   # cross-encoder reranker (ONNX, CPU, no torch) — retrieval.rerank
 langgraph>=0.2          # orchestration: ask pipeline as a graph (UPSC_RAG_PIPELINE=graph)
 langchain-core>=0.3     # message/runnable primitives used by the graph layer
-langchain-openai>=0.2   # ChatOpenAI/OpenAIEmbeddings — optional portability seam (UPSC_RAG_LLM_BACKEND=langchain)
+langchain-openai>=0.2   # ChatOpenAI/OpenAIEmbeddings — optional portability seam (UPSC_RAG_LLM_BACKEND=langchain); also the tool-calling agent (UPSC_RAG_PIPELINE=agentic)
+ddgs>=9.0               # DuckDuckGo web search (free, no key) — agentic pipeline's web_search tool
 networkx>=3.0
 fastapi>=0.110
 uvicorn[standard]>=0.29

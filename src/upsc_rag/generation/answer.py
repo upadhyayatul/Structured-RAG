@@ -78,6 +78,197 @@ _SYSTEM_PROMPT = (
 )
 
 
+# Agentic path: sources may come from the textbook AND/OR the web (see agent/). Unlike
+# _SYSTEM_PROMPT (book-only, no outside knowledge), this permits grounding in web
+# sources for current/post-2011 info the 2011 textbook can't contain — still strictly
+# from the supplied sources, never model memory, and still fully cited.
+_AGENTIC_SYSTEM_PROMPT = (
+    "You are a precise assistant for UPSC Indian Polity preparation. You are given "
+    "numbered sources from two kinds of place: the M. Laxmikanth 'Indian Polity' "
+    "TEXTBOOK (settled constitutional facts, but 6th ed. — dated to 2011) and the WEB "
+    "(latest/current information the textbook may predate). These sources are your "
+    "ENTIRE universe of knowledge for this question.\n\n"
+    "GROUND EVERY CLAIM in the sources — do not use outside or prior knowledge. Do NOT "
+    "add names, numbers, dates, case law, judgments, or Article numbers that are not "
+    "written in a source, even if you are confident they are true.\n"
+    "- Prefer the TEXTBOOK for settled constitutional provisions, structure, and "
+    "procedures.\n"
+    "- Use the WEB sources for recent constitutional amendments, post-2011 Supreme "
+    "Court judgments, current office-holders, and recent events; when a claim is "
+    "current or recent, say so and cite the web source.\n"
+    "- If the textbook and the web conflict (e.g. the book is out of date), follow the "
+    "web for the current position and note that the textbook predates it.\n"
+    "- If neither the textbook nor the web sources cover the question, say so plainly "
+    "instead of filling the gap from memory.\n\n"
+    "CITE ACCURATELY — this is mandatory: end every factual sentence, bullet, and "
+    "procedural step with the bracketed number(s) of the source(s) that actually state "
+    "that specific claim, e.g. '... [1].' or '... [2][4].'. Never cite a source that "
+    "does not support the claim. Use only the source numbers supplied.\n\n"
+    "Open with a one-sentence direct answer; name the governing Constitutional "
+    "Article(s) in **bold** when a source ties one to the claim. Then use short `##` "
+    "headings, bullet points, and **bold** the key operative terms. Earlier "
+    "conversation turns may precede the question — use them ONLY to resolve references; "
+    "still answer only the current question, grounded solely in the supplied sources."
+)
+
+
+def build_agentic_prompt(
+    query: str,
+    contexts: list[dict[str, Any]],
+    web: list[dict[str, Any]],
+) -> str:
+    """Format textbook + web sources into one numbered-source prompt for synthesis.
+
+    Textbook sources come first (deduped like ``build_source_dicts``), then web sources
+    (deduped by URL), continuing the same numbering — so the ``[n]`` markers the model
+    emits line up with ``build_agentic_sources`` (sources.py).
+    """
+    from upsc_rag.generation.sources import dedupe_results
+
+    blocks: list[str] = []
+    n = 0
+    for ctx in dedupe_results(contexts):
+        n += 1
+        title = " > ".join(ctx.get("section_path") or []) or ctx.get("chapter_title", "Unknown")
+        pages = ctx.get("page_start")
+        cite = f"{title} (p. {pages})" if pages else title
+        header = f"[{n}] TEXTBOOK — {cite}"
+        ents = ", ".join(e for e in (ctx.get("entities") or []) if e)
+        if ents:
+            header += f" — Articles: {ents}"
+        blocks.append(f"{header}\n{ctx.get('text', '')}")
+
+    seen_urls: set[str] = set()
+    for w in web:
+        url = w.get("url", "")
+        if not url or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        n += 1
+        blocks.append(f"[{n}] WEB — {w.get('title', '')} ({url})\n{w.get('snippet', '')}")
+
+    context_block = "\n\n".join(blocks) or "(no sources found)"
+    return (
+        "Answer using only the sources below — do not use any outside knowledge. Prefer "
+        "the TEXTBOOK for settled provisions and the WEB sources for latest/recent "
+        "information. End every sentence and bullet with the bracketed number(s) of the "
+        "source(s) that actually state it, e.g. [1] or [2][3]; never cite a source that "
+        "does not support the claim. If the sources do not cover part or all of the "
+        "question, say so plainly instead of filling the gap from memory.\n\n"
+        f"Question: {query}\n\n"
+        f"Sources:\n{context_block}\n\n"
+        "Answer:"
+    )
+
+
+def generate_agentic_answer(
+    query: str,
+    contexts: list[dict[str, Any]],
+    web: list[dict[str, Any]],
+    cfg: dict[str, Any],
+    client: OpenAI | None = None,
+    session_id: str | None = None,
+    usage_sink: dict[str, Any] | None = None,
+    history: list[dict[str, Any]] | None = None,
+) -> str:
+    """Synthesize a grounded, cited answer over combined textbook + web sources."""
+    gen_cfg = cfg.get("generation", {})
+    client = client or OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    model = gen_cfg.get("model", "gpt-4o-mini")
+    hist = _history_messages(history, cfg.get("conversation", {}).get("history_turns", 3))
+    messages = [
+        {"role": "system", "content": _AGENTIC_SYSTEM_PROMPT},
+        *hist,
+        {"role": "user", "content": build_agentic_prompt(query, contexts, web)},
+    ]
+
+    with trace_manager.trace(
+        "agentic_answer",
+        input={"query": query, "num_book": len(contexts), "num_web": len(web)},
+        session_id=session_id,
+    ) as trace:
+        gen = trace.generation(
+            "llm",
+            model=model,
+            input=messages,
+            model_parameters={
+                "temperature": gen_cfg.get("temperature", 0.2),
+                "max_tokens": gen_cfg.get("max_tokens", 1024),
+            },
+        )
+        with gen:
+            response = client.chat.completions.create(
+                model=model,
+                temperature=gen_cfg.get("temperature", 0.2),
+                max_tokens=gen_cfg.get("max_tokens", 1024),
+                messages=messages,
+            )
+            text = response.choices[0].message.content or ""
+            gen.end(output=text, usage=_usage_dict(response.usage))
+            _fill_usage_sink(usage_sink, model, response.usage)
+        trace.end(output={"answer_chars": len(text)})
+        return text
+
+
+def generate_agentic_answer_stream(
+    query: str,
+    contexts: list[dict[str, Any]],
+    web: list[dict[str, Any]],
+    cfg: dict[str, Any],
+    client: OpenAI | None = None,
+    session_id: str | None = None,
+    usage_sink: dict[str, Any] | None = None,
+    history: list[dict[str, Any]] | None = None,
+) -> Iterator[str]:
+    """Stream the synthesized answer over combined textbook + web sources."""
+    gen_cfg = cfg.get("generation", {})
+    client = client or OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    model = gen_cfg.get("model", "gpt-4o-mini")
+    hist = _history_messages(history, cfg.get("conversation", {}).get("history_turns", 3))
+    messages = [
+        {"role": "system", "content": _AGENTIC_SYSTEM_PROMPT},
+        *hist,
+        {"role": "user", "content": build_agentic_prompt(query, contexts, web)},
+    ]
+
+    with trace_manager.trace(
+        "agentic_answer",
+        input={"query": query, "num_book": len(contexts), "num_web": len(web)},
+        session_id=session_id,
+    ) as trace:
+        gen = trace.generation(
+            "llm",
+            model=model,
+            input=messages,
+            model_parameters={
+                "temperature": gen_cfg.get("temperature", 0.2),
+                "max_tokens": gen_cfg.get("max_tokens", 1024),
+            },
+        )
+        with gen:
+            stream = client.chat.completions.create(
+                model=model,
+                temperature=gen_cfg.get("temperature", 0.2),
+                max_tokens=gen_cfg.get("max_tokens", 1024),
+                stream=True,
+                stream_options={"include_usage": True},
+                messages=messages,
+            )
+            parts: list[str] = []
+            usage: Any = None
+            for chunk in stream:
+                if chunk.usage is not None:
+                    usage = chunk.usage
+                delta = chunk.choices[0].delta.content if chunk.choices else None
+                if delta:
+                    parts.append(delta)
+                    yield delta
+            text = "".join(parts)
+            gen.end(output=text, usage=_usage_dict(usage))
+            _fill_usage_sink(usage_sink, model, usage)
+        trace.end(output={"answer_chars": len(text)})
+
+
 def _history_messages(
     history: list[dict[str, Any]] | None, history_turns: int
 ) -> list[dict[str, str]]:
