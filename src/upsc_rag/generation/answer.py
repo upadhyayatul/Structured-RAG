@@ -1,11 +1,11 @@
 """Prompt builder and LLM call for grounded, source-cited answers from retrieved chunks."""
 from __future__ import annotations
 
-import os
 from typing import Any, Iterator
 
 from openai import OpenAI
 
+from upsc_rag.llm.clients import get_openai_client
 from upsc_rag.observability import trace_manager
 
 # Approx USD per 1M tokens, by model (OpenAI list prices — update if they change).
@@ -173,7 +173,7 @@ def generate_agentic_answer(
 ) -> str:
     """Synthesize a grounded, cited answer over combined textbook + web sources."""
     gen_cfg = cfg.get("generation", {})
-    client = client or OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    client = client or get_openai_client()
     model = gen_cfg.get("model", "gpt-4o-mini")
     hist = _history_messages(history, cfg.get("conversation", {}).get("history_turns", 3))
     messages = [
@@ -222,7 +222,7 @@ def generate_agentic_answer_stream(
 ) -> Iterator[str]:
     """Stream the synthesized answer over combined textbook + web sources."""
     gen_cfg = cfg.get("generation", {})
-    client = client or OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    client = client or get_openai_client()
     model = gen_cfg.get("model", "gpt-4o-mini")
     hist = _history_messages(history, cfg.get("conversation", {}).get("history_turns", 3))
     messages = [
@@ -335,7 +335,7 @@ def generate_answer(
     the model can resolve follow-up references.
     """
     gen_cfg = cfg.get("generation", {})
-    client = client or OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    client = client or get_openai_client()
     model = gen_cfg.get("model", "gpt-4o-mini")
     prompt = build_answer_prompt(query, contexts)
     hist = _history_messages(history, cfg.get("conversation", {}).get("history_turns", 3))
@@ -388,7 +388,7 @@ def generate_answer_stream(
     inserted before the current question so the model can resolve follow-up references.
     """
     gen_cfg = cfg.get("generation", {})
-    client = client or OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    client = client or get_openai_client()
     model = gen_cfg.get("model", "gpt-4o-mini")
     hist = _history_messages(history, cfg.get("conversation", {}).get("history_turns", 3))
     messages = [

@@ -18,7 +18,6 @@ from langchain_core.messages import (
     SystemMessage,
     ToolMessage,
 )
-from openai import OpenAI
 
 from upsc_rag.agent.state import AgentState
 from upsc_rag.agent.tools import (
@@ -29,6 +28,12 @@ from upsc_rag.agent.tools import (
 from upsc_rag.generation.answer import _history_messages, generate_agentic_answer
 from upsc_rag.generation.router import OUT_OF_SCOPE_REPLY
 from upsc_rag.generation.sources import build_agentic_sources
+from upsc_rag.llm.clients import (
+    _gateway_api_key,
+    _gateway_base_url,
+    gateway_enabled,
+    get_openai_client,
+)
 from upsc_rag.retrieval.hybrid import HybridRetriever
 from upsc_rag.retrieval.web import web_search
 
@@ -116,7 +121,7 @@ def make_domain_gate_node(cfg: dict[str, Any]) -> Node:
 def _is_polity(query: str, model: str, session_id: str | None) -> bool:
     """Cheap LLM classifier: is ``query`` about Indian polity? Fails open (True) on error."""
     try:
-        client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+        client = get_openai_client()
         resp = client.chat.completions.create(
             model=model,
             temperature=0.0,
@@ -139,11 +144,15 @@ def make_agent_node(cfg: dict[str, Any]) -> Node:
     def agent_node(state: AgentState) -> dict[str, Any]:
         from langchain_openai import ChatOpenAI
 
-        llm = ChatOpenAI(
-            model=model_name,
-            temperature=temperature,
-            api_key=os.environ.get("OPENAI_API_KEY"),
-        ).bind_tools(TOOL_SCHEMAS)
+        kwargs: dict[str, Any] = {
+            "model": model_name,
+            "temperature": temperature,
+            "api_key": os.environ.get("OPENAI_API_KEY"),
+        }
+        if gateway_enabled():
+            kwargs["base_url"] = _gateway_base_url()
+            kwargs["api_key"] = _gateway_api_key()
+        llm = ChatOpenAI(**kwargs).bind_tools(TOOL_SCHEMAS)
         resp = llm.invoke(state["messages"])
         return {"messages": [resp], "iterations": 1}
 

@@ -15,6 +15,7 @@ from qdrant_client import QdrantClient
 from rank_bm25 import BM25Okapi
 
 from upsc_rag.chunking.structured import extract_entities
+from upsc_rag.llm.clients import get_openai_client
 from upsc_rag.observability import NOOP_CONTEXT, trace_manager
 
 _RRF_K = 60  # constant from the RRF paper (Cormack et al. 2009)
@@ -115,7 +116,11 @@ class HybridRetriever:
             )
 
         self._qdrant = QdrantClient(url=indexing_cfg["qdrant_url"])
+        # Embeddings stay on the direct OpenAI endpoint (dimension-locked to Qdrant,
+        # deliberately NOT routed through the LiteLLM gateway).
         self._openai = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+        # Query rewrite is a chat call, so it goes through the gateway when enabled.
+        self._chat_client = get_openai_client()
 
         # Load all chunks once; split into child corpus (BM25) and parent text map
         all_chunks = list(load_chunks_jsonl(chunks_path))
@@ -344,7 +349,7 @@ class HybridRetriever:
         from upsc_rag.retrieval.rewrite import rewrite_query
 
         return rewrite_query(
-            query, self._openai, model=self._rewrite_model,
+            query, self._chat_client, model=self._rewrite_model,
             num_variants=self._rewrite_num_variants, obs=obs,
         )
 

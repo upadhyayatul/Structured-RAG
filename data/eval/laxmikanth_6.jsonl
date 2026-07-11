@@ -28,3 +28,43 @@
 {"question": "what does the CAG actually do day to day?", "section_contains": ["comptroller and auditor general", "duties"], "articles": []}
 {"question": "is the election commission genuinely independent, can they fire the CEC easily?", "section_contains": ["election commission", "independence"], "articles": []}
 {"question": "whats the GST council and who actually sits on it?", "section_contains": ["goods and services tax council"], "articles": []}
+{"question": "How is the Vice-President of India elected?", "section_contains": ["vice-president", "election"], "articles": ["Article 66"]}
+{"question": "What are the powers and functions of the Vice-President?", "section_contains": ["vice-president", "powers and functions"], "articles": ["Article 64"]}
+{"question": "so if parliament passes a bill can the president just refuse to sign it, what are his veto options?", "section_contains": ["veto power"], "articles": ["Article 111"]}
+{"question": "how can the president make laws when parliament isnt even in session?", "section_contains": ["ordinance-making power"], "articles": ["Article 123"]}
+{"question": "can the president pardon someone on death row?", "section_contains": ["pardoning power"], "articles": ["Article 72"]}
+{"question": "how are members of the Rajya Sabha chosen and how many can it have?", "section_contains": ["parliament", "composition of the two houses"], "articles": ["Article 80"]}
+{"question": "what exactly makes a bill a money bill and who decides that?", "section_contains": ["parliament", "legislative procedure"], "articles": []}
+{"question": "what happens when the two houses of parliament disagree on a bill, is there a joint sitting?", "section_contains": ["joint sitting"], "articles": ["Article 108"]}
+{"question": "how is the Speaker of the Lok Sabha elected and what does he do?", "section_contains": ["parliament", "presiding officers"], "articles": ["Article 93"]}
+{"question": "if the ruling govt loses majority how is it forced out through collective responsibility?", "section_contains": ["central council of ministers", "responsibility"], "articles": []}
+{"question": "whos the govt's chief lawyer that argues cases in the supreme court?", "section_contains": ["attorney general"], "articles": []}
+{"question": "what does the finance commission actually do and how often is it set up?", "section_contains": ["finance commission", "functions"], "articles": ["Article 280"]}
+{"question": "can a UPSC member be removed and who has the power to do it?", "section_contains": ["union public service commission", "removal"], "articles": []}
+{"question": "what ideals does the preamble of the constitution talk about?", "section_contains": ["preamble", "key words in the preamble"], "articles": []}
+{"question": "what are the fundamental duties every citizen is supposed to follow?", "section_contains": ["fundamental duties", "list of fundamental duties"], "articles": []}
+{"question": "What does the right to equality guarantee under the Constitution?", "section_contains": ["right to equality"], "articles": ["Article 14"]}
+{"question": "does the constitution ban child labour and forced labour?", "section_contains": ["right against exploitation"], "articles": ["Article 24"]}
+{"question": "am i free to practise and preach my own religion under the fundamental rights?", "section_contains": ["right to freedom of religion"], "articles": ["Article 25"]}
+{"question": "is free education a fundamental right for kids in india?", "section_contains": ["cultural and educational rights"], "articles": ["Article 21A"]}
+{"question": "how does someone actually acquire indian citizenship, is it by birth or what?", "section_contains": ["citizenship", "citizenship act"], "articles": []}
+{"question": "why does delhi have a special status different from other union territories?", "section_contains": ["union territories", "special provisions for delhi"], "articles": []}
+{"question": "what did the 74th amendment do for city municipalities and urban local bodies?", "section_contains": ["municipalities", "74th amendment"], "articles": []}
+{"question": "which language is the official language of the union govt?", "section_contains": ["official language", "language of the union"], "articles": ["Article 343"]}
+{"question": "what are the constitutional provisions governing the civil services and government employees?", "section_contains": ["public services", "constitutional provisions"], "articles": ["Article 309", "Article 310"]}
+{"question": "how are law-making powers divided between the centre and the states?", "section_contains": ["centre", "legislative relations"], "articles": []}
+{"question": "what discretionary powers can a governor use without the advice of the state cabinet?", "section_contains": ["governor", "powers and functions of governor"], "articles": []}
+{"question": "what does judicial review actually mean and where does the court get that power?", "section_contains": ["judicial review", "meaning of judicial review"], "articles": []}
+{"question": "whats a PIL and how is it different from a normal court case?", "section_contains": ["public interest litigation", "meaning of pil"], "articles": []}
+{"question": "what are administrative tribunals and why were they created?", "section_contains": ["tribunals", "administrative tribunals"], "articles": ["Article 323A"]}
+{"question": "whats this Lokpal thing supposed to do about corruption?", "section_contains": ["lokpal"], "articles": []}
+{"question": "what is the central vigilance commission's job?", "section_contains": ["central vigilance commission"], "articles": []}
+{"question": "when and why was the CBI set up?", "section_contains": ["central bureau of investigation"], "articles": []}
+{"question": "how is the National Human Rights Commission composed and who heads it?", "section_contains": ["national human rights commission", "composition"], "articles": []}
+{"question": "what is NITI Aayog and what does it actually do, isnt it just the old planning commission?", "section_contains": ["niti aayog"], "articles": []}
+{"question": "how does the central information commission help with RTI requests?", "section_contains": ["central information commission"], "articles": []}
+{"question": "did the 97th amendment give cooperative societies any constitutional protection?", "section_contains": ["co-operative societies", "97th amendment"], "articles": []}
+{"question": "what are zonal councils and what purpose do they serve?", "section_contains": ["inter-state relations", "zonal councils"], "articles": []}
+{"question": "how are disputes between states over river water resolved?", "section_contains": ["inter-state water disputes"], "articles": []}
+{"question": "what are the federal features that make india a federation?", "section_contains": ["federal system", "federal features"], "articles": []}
+{"question": "what happens to fundamental rights when a national emergency is in force?", "section_contains": ["emergency", "national emergency"], "articles": ["Article 358"]}

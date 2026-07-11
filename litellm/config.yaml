@@ -1,0 +1,36 @@
+# LiteLLM proxy — OpenAI-compatible AI gateway for Structured-RAG.
+#
+# Fronts every CHAT/completion call the app makes (answer generation, query rewrite,
+# history condense, agentic domain gate + tool router, LLM-judge). Embeddings are NOT
+# routed here — they stay on the direct OpenAI endpoint (dimension-locked to Qdrant).
+#
+# The `model_name` aliases below are IDENTICAL to the model strings in
+# config/default.yaml, so the app passes the same names and needs no config change.
+# Add a new alias here whenever you introduce a new chat model in the app config.
+#
+# Run:  litellm --config litellm/config.yaml   (or `docker-compose up -d litellm`)
+# Test: curl http://localhost:4000/health/liveliness
+
+model_list:
+  - model_name: gpt-4o-mini          # generation.model, agent.model
+    litellm_params:
+      model: openai/gpt-4o-mini
+      api_key: os.environ/OPENAI_API_KEY
+  - model_name: gpt-4.1-nano         # retrieval.rewrite.model, conversation.condense_model, agent.domain_gate_model
+    litellm_params:
+      model: openai/gpt-4.1-nano
+      api_key: os.environ/OPENAI_API_KEY
+  - model_name: gpt-5-mini           # eval.judge.model
+    litellm_params:
+      model: openai/gpt-5-mini
+      api_key: os.environ/OPENAI_API_KEY
+
+litellm_settings:
+  # Fail a request over to the next listed deployment on error. Add more deployments
+  # under a shared model_name (e.g. an Azure or Anthropic backend) to make this useful.
+  drop_params: true
+
+general_settings:
+  # Clients must present this key as their Bearer token (set LITELLM_API_KEY in the app
+  # to the same value, or issue virtual keys from it). Read from the proxy's environment.
+  master_key: os.environ/LITELLM_MASTER_KEY

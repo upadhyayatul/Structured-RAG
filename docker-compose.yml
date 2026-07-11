@@ -63,6 +63,23 @@ services:
       LANGFUSE_INIT_USER_NAME: "dev"
       LANGFUSE_INIT_USER_PASSWORD: "localdevpassword"
 
+  litellm:
+    # OpenAI-compatible AI gateway. Fronts every CHAT call the app makes (not embeddings).
+    # Enable in the app with UPSC_RAG_LLM_GATEWAY=litellm + LITELLM_BASE_URL/LITELLM_API_KEY.
+    image: ghcr.io/berriai/litellm:main-stable
+    container_name: litellm
+    restart: unless-stopped
+    ports:
+      - "4000:4000"   # OpenAI-compatible endpoint (base_url = http://localhost:4000)
+    volumes:
+      - ./litellm/config.yaml:/app/config.yaml:ro
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    environment:
+      # The upstream provider key the proxy uses to call OpenAI, plus the master key
+      # clients present to the proxy. Supply both via .env (compose reads it automatically).
+      OPENAI_API_KEY: "${OPENAI_API_KEY}"
+      LITELLM_MASTER_KEY: "${LITELLM_MASTER_KEY}"
+
 volumes:
   langfuse_db_data:
   # Adopt the existing, already-populated Qdrant volume (created via `docker run`)

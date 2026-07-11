@@ -8,12 +8,12 @@ this step only fixes the retrieval query.
 """
 from __future__ import annotations
 
-import os
 from typing import Any
 
 from openai import OpenAI
 
 from upsc_rag.generation.answer import _usage_dict
+from upsc_rag.llm.clients import get_openai_client
 from upsc_rag.observability import trace_manager
 
 _CONDENSE_SYSTEM = (
@@ -61,7 +61,7 @@ def condense_query(
     if not transcript:
         return query
 
-    client = client or OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    client = client or get_openai_client()
     messages = [
         {"role": "system", "content": _CONDENSE_SYSTEM},
         {
