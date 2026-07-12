@@ -22,7 +22,14 @@ retrieval:
   top_k: 30
   rerank_top_k: 8
   exclude_section_titles: []   # e.g. ["Notes and References"] to drop bibliographic sections. Left OFF: dedup already stops Notes flooding, and excluding them regresses MRR/recall on the coarse-labelled gold
-  relevance_floor: 0.30    # off-topic gate: if the query's top dense cosine < this, skip generation and return an out-of-scope reply (0 disables)
+  relevance_floor: 0.15    # off-topic gate: if the query's top dense cosine < this, skip generation and return an out-of-scope reply (0 disables)
+  web_fallback:            # when the retrieved sections are on-topic but don't ANSWER the question, search the web
+    enabled: true          # false = textbook-only (today's behavior), and no classifier call at all
+    model: gpt-4.1-nano    # cheap yes/no classifier: do these sections contain what was asked?
+    max_source_chars: 600  # per-section text shown to the classifier (headings + head of the text)
+    # Runs AFTER the relevance floor, so off-topic junk never reaches the web. Cannot be gated on the
+    # retrieval score: 'what did the Constitution makers intend?' retrieves the right chapter with a
+    # HIGH score yet the book never states the intent — relevance and sufficiency are different things.
   rewrite:
     enabled: true          # LLM query rewriting: expand synonyms/abbreviations, multi-query retrieval
     num_variants: 3        # number of rephrasings to add alongside the original query
@@ -51,8 +58,42 @@ generation:
   temperature: 0.2
   max_tokens: 1024
 
+conversation:                # multi-turn: resolve follow-ups against recent chat history
+  enabled: true              # condense follow-ups for retrieval + pass history to the answer LLM
+  history_turns: 3           # prior exchanges kept (N questions + N answers = 2N messages)
+  condense_model: gpt-4.1-nano   # cheap LLM that rewrites a follow-up into a standalone search query
+
+agent:                       # tool-calling agentic pipeline (UPSC_RAG_PIPELINE=agentic): LLM decides textbook vs web search
+  model: gpt-4o-mini         # agent model — must support tool/function calling
+  temperature: 0.0           # deterministic tool-routing decisions
+  max_iterations: 4          # hard cap on the ReAct agent⇄tools loop (prevents runaway tool use)
+  domain_gate_model: gpt-4.1-nano  # cheap yes/no classifier: only Indian-polity questions reach the tools (esp. web)
+
+web_search:                  # DuckDuckGo web tool (free, no API key; ddgs package)
+  max_results: 5             # results kept after merging the query variants (caps prompt size)
+  region: in-en              # DuckDuckGo region bias (India / English) for polity relevance
+  num_queries: 3             # the question is rewritten into up to N keyword queries, searched in
+                             # parallel and merged round-robin. A search engine is literal: sent
+                             # "who is the current CJI and UPSC chairmain" verbatim it returns SEO
+                             # filler, while "Chief Justice of India current appointment" returns the
+                             # answer. Also splits a compound question into one query per part.
+
 eval:
   generation:               # cheap generation-quality signals (scripts/evaluate_generation.py) — no LLM judge
     embed_model: text-embedding-3-small  # embedder for groundedness + answer-relevance cosines (cheap; separate from the 3-large corpus model)
     ground_threshold: 0.65  # min cosine(answer-sentence, best source SENTENCE-window) to count a sentence as 'supported'. Raised 0.5->0.65 once groundedness matched sentence windows (not whole sections): window-matching lifts the support floor (mean ~0.76), so 0.5 saturated at ~99% and lost discriminative power
+  judge:                    # LLM-as-judge rubric (scripts/evaluate_judge.py) — nuanced criteria the cheap signals can't cover + cross-check of them
+    base_url: https://api.openai.com/v1        # OpenAI's endpoint (reuse the openai SDK, only base_url/key differ)
+    model: gpt-5-mini                          # stronger, DIFFERENT model than the gpt-4o-mini generator, so it won't rubber-stamp the generator's own style (same-provider self-preference is reduced, not eliminated — accepted trade-off)
+    api_key_env: OPENAI_API_KEY                # same key the generator + cheap-signal embeddings use (key: https://platform.openai.com/api-keys)
+    temperature: 0.0                           # deterministic scoring for non-reasoning models; IGNORED for gpt-5/o-series (they reject temperature!=1), see judge.py._is_reasoning_model
+    reasoning_effort: low                      # gpt-5 reasoning depth for the judge: enough to apply the rubric, low to keep latency/cost down (only used for reasoning models)
+    max_source_chars: 3000                     # truncate each source shown to the judge; raised 1500->3000 so the judge sees (nearly) the full parent section the generator saw — several faithfulness/citation dings were content the judge simply couldn't see. No per-day token cap on OpenAI
+    request_interval_sec: 0                    # no free-tier per-minute pacing needed on OpenAI's generous paid limits; the rate-limit backoff in judge.py is the safety net
+
+observability:
+  scores:                     # per-question quality scores attached to each live Langfuse `ask` trace (direct pipeline)
+    enabled: true             # set false to disable; skips the extra embed call entirely
+    embed_model: text-embedding-3-small   # cheap embedder for groundedness + answer-relevance (same as eval.generation)
+    ground_threshold: 0.65    # min cosine(answer-sentence, best source window) to count a sentence 'supported' (mirrors eval.generation.ground_threshold)
 

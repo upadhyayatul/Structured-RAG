@@ -15,6 +15,7 @@ from qdrant_client import QdrantClient
 from rank_bm25 import BM25Okapi
 
 from upsc_rag.chunking.structured import extract_entities
+from upsc_rag.llm.clients import get_openai_client
 from upsc_rag.observability import NOOP_CONTEXT, trace_manager
 
 _RRF_K = 60  # constant from the RRF paper (Cormack et al. 2009)
@@ -115,7 +116,11 @@ class HybridRetriever:
             )
 
         self._qdrant = QdrantClient(url=indexing_cfg["qdrant_url"])
+        # Embeddings stay on the direct OpenAI endpoint (dimension-locked to Qdrant,
+        # deliberately NOT routed through the LiteLLM gateway).
         self._openai = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+        # Query rewrite is a chat call, so it goes through the gateway when enabled.
+        self._chat_client = get_openai_client()
 
         # Load all chunks once; split into child corpus (BM25) and parent text map
         all_chunks = list(load_chunks_jsonl(chunks_path))
@@ -238,6 +243,7 @@ class HybridRetriever:
         top_k: int | None = None,
         rerank_top_k: int | None = None,
         session_id: str | None = None,
+        parent: Any = None,
     ) -> list[dict[str, Any]]:
         """Return rerank_top_k results ranked by RRF, with parent text for generation.
 
@@ -245,13 +251,15 @@ class HybridRetriever:
         all dense+BM25 rank lists together (multi-query RRF) to improve recall.
 
         ``session_id`` (optional) groups this trace with the answer trace for the same
-        question under one Langfuse Session.
+        question under one Langfuse Session. Pass ``parent`` to nest this as a child
+        span under a request-level root trace instead of emitting its own root trace.
         """
         top_k = top_k if top_k is not None else self._default_top_k
         rerank_top_k = rerank_top_k if rerank_top_k is not None else self._default_rerank_top_k
 
-        with trace_manager.trace(
+        with trace_manager.start(
             "retrieve",
+            parent=parent,
             input={"query": query, "top_k": top_k, "rerank_top_k": rerank_top_k},
             session_id=session_id,
         ) as trace:
@@ -265,6 +273,17 @@ class HybridRetriever:
             # Gate: expand with rewrite variants only when the first pass is weak BUT
             # still plausibly on-topic. A score below the relevance floor is off-topic
             # and will be rejected downstream, so skip the costly rewrite there.
+            #
+            # The lower bound is load-bearing, and NOT (as it looks) a mere cost saving.
+            # Rewriting a sub-floor query and letting its variants raise the score would
+            # break the off-topic gate: the rewrite LLM is instructed to emit *polity*
+            # queries, so for "best recipe for pasta carbonara" it duly produces
+            # polity-flavoured variants that match real sections (measured: first pass
+            # 0.09 -> 0.43, sailing past the 0.30 floor). The gate would then be asking
+            # "can the rewriter find anything in the book?" — to which the answer is
+            # always yes — instead of "is the user's question in the book?".
+            # Abbreviations that sink a query below the floor ("from where was the FD
+            # taken?") are resolved upstream in generation/condense.py instead.
             rewrite_fired = False
             if (
                 self._rewrite_enabled
@@ -344,7 +363,7 @@ class HybridRetriever:
         from upsc_rag.retrieval.rewrite import rewrite_query
 
         return rewrite_query(
-            query, self._openai, model=self._rewrite_model,
+            query, self._chat_client, model=self._rewrite_model,
             num_variants=self._rewrite_num_variants, obs=obs,
         )
 
@@ -404,7 +423,12 @@ class HybridRetriever:
     def _search_one(
         self, query: str, top_k: int, obs: Any = NOOP_CONTEXT
     ) -> tuple[dict[str, int], dict[str, int], dict[str, dict]]:
-        """Run dense + BM25 for a single query variant (called concurrently per variant)."""
+        """Run dense + BM25 for a single query variant (called concurrently per variant).
+
+        The variant's own dense top score is deliberately dropped: the relevance gate
+        must judge the USER's query, not the best score a rewrite could manufacture
+        (see the rewrite gate in ``retrieve``).
+        """
         dense_ranks, payloads, _ = self._dense_search(query, top_k, obs=obs)
         bm25_ranks = self._bm25_search(query, top_k, obs=obs)
         return dense_ranks, bm25_ranks, payloads

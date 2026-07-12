@@ -8,12 +8,21 @@ import type { Source } from "@/app/types";
 interface ChatMessage {
   role: "user" | "assistant";
   content: string;
+  quote?: string; // excerpt this user question was asked "about" (reply-style)
   sources?: Source[];
   ttftMs?: number;
   costUsd?: number;
   totalTokens?: number;
   streaming?: boolean;
   error?: boolean;
+  status?: string; // pipeline stage being waited on ("Searching the textbook…"), until the first token
+}
+
+// A live text selection inside an assistant answer, plus where to float the button.
+interface AnswerSelection {
+  text: string;
+  x: number; // viewport px, horizontal center of the selection
+  y: number; // viewport px, top of the selection
 }
 
 export default function Home() {
@@ -21,7 +30,13 @@ export default function Home() {
   const [input, setInput] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [loading, setLoading] = useState(false);
+  // Pending reply-quote (excerpt the user picked "Ask about this" on), shown above the input.
+  const [quote, setQuote] = useState<string | null>(null);
+  // Live selection inside an answer → drives the floating "Ask about this" button.
+  const [selection, setSelection] = useState<AnswerSelection | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
   // One stable id per page load = one conversation = one Langfuse Session.
   const sessionId = useRef<string>(crypto.randomUUID());
 
@@ -33,6 +48,47 @@ export default function Home() {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
+  // Detect a text selection made INSIDE an assistant answer (marked data-answer),
+  // and remember it so we can float an "Ask about this" button near it.
+  useEffect(() => {
+    function onMouseUp() {
+      const sel = window.getSelection();
+      const text = sel?.toString().trim() ?? "";
+      if (!sel || sel.isCollapsed || !text) {
+        setSelection(null);
+        return;
+      }
+      const anchor = sel.anchorNode;
+      const el = anchor instanceof Element ? anchor : anchor?.parentElement;
+      if (!el?.closest("[data-answer]")) {
+        setSelection(null); // selection outside an answer (user bubble, sources, input)
+        return;
+      }
+      const rect = sel.getRangeAt(0).getBoundingClientRect();
+      setSelection({ text, x: rect.left + rect.width / 2, y: rect.top });
+    }
+    document.addEventListener("mouseup", onMouseUp);
+    return () => document.removeEventListener("mouseup", onMouseUp);
+  }, []);
+
+  // The floating button is anchored to viewport coords, so hide it once the user scrolls.
+  useEffect(() => {
+    const node = scrollRef.current;
+    if (!node) return;
+    const hide = () => setSelection(null);
+    node.addEventListener("scroll", hide);
+    return () => node.removeEventListener("scroll", hide);
+  }, []);
+
+  // Promote the live selection to a pending reply-quote and focus the input.
+  function askAboutSelection() {
+    if (!selection) return;
+    setQuote(selection.text);
+    setSelection(null);
+    window.getSelection()?.removeAllRanges();
+    inputRef.current?.focus();
+  }
+
   // Patch the most recent message in place (used while streaming).
   function patchLast(patch: Partial<ChatMessage>) {
     setMessages((m) => {
@@ -42,17 +98,37 @@ export default function Home() {
     });
   }
 
-  async function send(e: React.FormEvent) {
+  function send(e: React.FormEvent) {
     e.preventDefault();
-    const q = input.trim();
+    submitQuery(input.trim());
+  }
+
+  async function submitQuery(q: string) {
     if (!q || loading) return;
+
+    // If a passage was quoted, fold it into the query the backend sees so the
+    // follow-up's retrieval + answer take the excerpt into account; keep `quote`
+    // on the message separately so the UI can show it reply-style.
+    const activeQuote = quote;
+    const backendQuery = activeQuote
+      ? `Regarding this excerpt from the previous answer:\n"${activeQuote}"\n\n${q}`
+      : q;
+
+    // Recent conversation for follow-up resolution: only completed turns, last N
+    // exchanges (N questions + N answers), stripped to {role, content}. `messages`
+    // here still holds the prior conversation (the new turn is appended below).
+    const history = messages
+      .filter((m) => !m.streaming && !m.error && m.content)
+      .map((m) => ({ role: m.role, content: m.content }))
+      .slice(-HISTORY_EXCHANGES * 2);
 
     setMessages((m) => [
       ...m,
-      { role: "user", content: q },
+      { role: "user", content: q, quote: activeQuote ?? undefined },
       { role: "assistant", content: "", streaming: true },
     ]);
     setInput("");
+    setQuote(null);
     setLoading(true);
 
     const start = performance.now();
@@ -63,7 +139,7 @@ export default function Home() {
       const res = await fetch("/api/ask", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query: q, sessionId: sessionId.current }),
+        body: JSON.stringify({ query: backendQuery, history, sessionId: sessionId.current }),
       });
 
       if (!res.ok || !res.body) {
@@ -85,17 +161,25 @@ export default function Home() {
         for (const line of lines) {
           if (!line.trim()) continue;
           const evt = JSON.parse(line);
-          if (evt.type === "sources") {
+          if (evt.type === "status") {
+            // What the backend is doing right now — shown in place of "Thinking…".
+            patchLast({ status: evt.label as string });
+          } else if (evt.type === "sources") {
             patchLast({ sources: evt.sources as Source[] });
           } else if (evt.type === "token") {
             if (ttft === null) {
               ttft = performance.now() - start;
-              patchLast({ ttftMs: ttft });
+              // The answer is arriving, so the stage caption has done its job.
+              patchLast({ ttftMs: ttft, status: undefined });
             }
             answer += evt.text;
             patchLast({ content: answer });
           } else if (evt.type === "done") {
+            // "done" marks the end of the answer; the connection stays open a few
+            // more seconds for backend scoring + trace flush, so don't wait for
+            // stream close to reveal the stamp/references.
             patchLast({
+              streaming: false,
               costUsd: typeof evt.cost_usd === "number" ? evt.cost_usd : undefined,
               totalTokens:
                 typeof evt.input_tokens === "number" && typeof evt.output_tokens === "number"
@@ -125,25 +209,28 @@ export default function Home() {
           href="https://github.com"
           target="_blank"
           rel="noreferrer"
-          className="text-sm text-neutral-500 hover:text-neutral-700 dark:hover:text-neutral-300"
+          className="text-sm text-muted underline decoration-rule underline-offset-4 hover:text-foreground"
         >
           Source Code
         </a>
       </div>
 
-      <div className="flex-1 overflow-y-auto">
+      <div ref={scrollRef} className="flex-1 overflow-y-auto">
         <div className="mx-auto w-full max-w-3xl px-4 pb-6">
           <header className="py-8 text-center">
-            <h1 className="text-3xl font-bold">UPSC Polity Chat</h1>
-            <p className="mt-2 text-sm text-neutral-500">
+            <h1 className="font-display text-3xl uppercase tracking-widest">UPSC Polity Chat</h1>
+            <div className="mx-auto mt-3 w-56 border-t-4 border-double border-rule" aria-hidden />
+            <p className="mt-3 text-xs uppercase tracking-[0.18em] text-muted">
               Grounded RAG over M. Laxmikanth&apos;s <em>Indian Polity</em> (6th ed.) — answers with page citations.
             </p>
           </header>
 
+          {messages.length === 0 && <SampleQuestions onPick={submitQuery} />}
+
           <div className="flex flex-col gap-6">
             {messages.map((m, i) =>
               m.role === "user" ? (
-                <UserBubble key={i} text={m.content} />
+                <UserBubble key={i} text={m.content} quote={m.quote} />
               ) : (
                 <AssistantMessage key={i} message={m} />
               ),
@@ -153,32 +240,114 @@ export default function Home() {
         </div>
       </div>
 
-      <div className="border-t border-neutral-200 dark:border-neutral-800">
-        <form onSubmit={send} className="mx-auto flex w-full max-w-3xl items-center gap-2 px-4 py-4">
-          <input
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            placeholder="Send a message…"
-            className="flex-1 rounded-lg border border-neutral-300 bg-transparent px-4 py-3 text-sm outline-none focus:border-neutral-500 dark:border-neutral-700"
-          />
+      <div className="border-t border-rule">
+        <div className="mx-auto w-full max-w-3xl px-4">
+          {quote && <ReplyPreview quote={quote} onClear={() => setQuote(null)} />}
+          <form onSubmit={send} className="flex w-full items-center gap-3 py-4">
+            <input
+              ref={inputRef}
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              placeholder={quote ? "Ask about the quoted text…" : "Type your query…"}
+              className="flex-1 rounded-none border-b-2 border-rule bg-transparent px-1 py-3 text-sm outline-none placeholder:text-muted/70 focus:border-foreground"
+            />
+            <button
+              type="submit"
+              disabled={loading || !input.trim()}
+              aria-label="Send"
+              className="rounded-sm border border-foreground/40 bg-card p-3 text-foreground shadow-[2px_2px_0_var(--rule)] hover:bg-background active:translate-x-px active:translate-y-px active:shadow-none disabled:opacity-40"
+            >
+              <SendIcon />
+            </button>
+          </form>
+        </div>
+      </div>
+
+      {selection && (
+        <button
+          // preventDefault on mousedown keeps the text selection alive through the click.
+          onMouseDown={(e) => {
+            e.preventDefault();
+            askAboutSelection();
+          }}
+          style={{
+            position: "fixed",
+            top: Math.max(8, selection.y - 40),
+            left: selection.x,
+            transform: "translateX(-50%)",
+          }}
+          className="z-50 flex items-center gap-1.5 rounded-sm border border-foreground/50 bg-card px-3 py-1.5 font-display text-xs uppercase tracking-wider text-foreground shadow-[2px_2px_0_var(--rule)] hover:bg-background"
+        >
+          <QuoteIcon />
+          Ask about this
+        </button>
+      )}
+    </div>
+  );
+}
+
+// How many recent exchanges (question + answer pairs) to send as conversation
+// context for follow-up resolution. Keep in sync with `conversation.history_turns`
+// in config/default.yaml.
+const HISTORY_EXCHANGES = 3;
+
+// Tappable starter prompts shown on the empty startup state to cue users on what to ask.
+const SAMPLE_QUESTIONS = [
+  "What is the difference between Fundamental Rights and Directive Principles?",
+  "Explain the powers of the President of India.",
+  "How is the Prime Minister of India appointed?",
+  "What are the key features of Indian federalism?",
+];
+
+function SampleQuestions({ onPick }: { onPick: (q: string) => void }) {
+  return (
+    <div className="mb-2">
+      <p className="mb-3 text-center font-display text-xs uppercase tracking-[0.2em] text-muted">
+        Try asking
+      </p>
+      <div className="flex flex-wrap justify-center gap-2">
+        {SAMPLE_QUESTIONS.map((q) => (
           <button
-            type="submit"
-            disabled={loading || !input.trim()}
-            aria-label="Send"
-            className="rounded-lg border border-neutral-300 p-3 text-neutral-600 hover:bg-neutral-100 disabled:opacity-40 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-900"
+            key={q}
+            type="button"
+            onClick={() => onPick(q)}
+            className="rounded-sm border border-rule bg-card px-4 py-2 text-left text-sm text-foreground/90 transition-colors hover:border-foreground/60"
           >
-            <SendIcon />
+            {q}
           </button>
-        </form>
+        ))}
       </div>
     </div>
   );
 }
 
-function UserBubble({ text }: { text: string }) {
+// WhatsApp-style reply preview: the quoted excerpt pinned above the input, with a clear button.
+function ReplyPreview({ quote, onClear }: { quote: string; onClear: () => void }) {
+  return (
+    <div className="mt-3 flex items-start gap-2 rounded-sm border-l-2 border-stamp-red bg-card px-3 py-2">
+      <QuoteIcon />
+      <p className="line-clamp-2 flex-1 text-xs italic text-muted">{quote}</p>
+      <button
+        type="button"
+        onClick={onClear}
+        aria-label="Remove quote"
+        className="text-muted hover:text-foreground"
+      >
+        <CloseIcon />
+      </button>
+    </div>
+  );
+}
+
+function UserBubble({ text, quote }: { text: string; quote?: string }) {
   return (
     <div className="flex justify-end">
-      <div className="max-w-[80%] rounded-2xl bg-neutral-900 px-4 py-2.5 text-sm text-white dark:bg-white dark:text-black">
+      <div className="max-w-[80%] rounded-sm border border-foreground/30 bg-card px-4 py-2.5 text-sm shadow-[2px_2px_0_var(--rule)]">
+        {quote && (
+          <div className="mb-1.5 line-clamp-3 border-l-2 border-stamp-red/60 pl-2 text-xs italic text-muted">
+            {quote}
+          </div>
+        )}
         {text}
       </div>
     </div>
@@ -187,10 +356,12 @@ function UserBubble({ text }: { text: string }) {
 
 function AssistantMessage({ message }: { message: ChatMessage }) {
   const waiting = message.streaming && !message.content;
+  const provenance = answerProvenance(message);
 
   if (message.error) {
     return (
-      <div className="whitespace-pre-wrap rounded-lg border border-red-400/40 bg-red-500/10 px-4 py-3 text-sm text-red-500 dark:text-red-400">
+      <div className="whitespace-pre-wrap rounded-sm border border-stamp-red/60 bg-card px-4 py-3 text-sm text-stamp-red">
+        <span className="font-display uppercase tracking-wider">Error: </span>
         {message.content}
       </div>
     );
@@ -199,7 +370,7 @@ function AssistantMessage({ message }: { message: ChatMessage }) {
   return (
     <div className="space-y-3">
       {(message.ttftMs != null || message.costUsd != null) && (
-        <div className="flex flex-wrap gap-x-2 text-xs text-neutral-400">
+        <div className="flex flex-wrap gap-x-2 text-[11px] uppercase tracking-[0.12em] text-muted">
           {message.ttftMs != null && (
             <span>First token in {(message.ttftMs / 1000).toFixed(1)}s</span>
           )}
@@ -221,33 +392,50 @@ function AssistantMessage({ message }: { message: ChatMessage }) {
       )}
 
       {waiting ? (
-        <div className="flex items-center gap-2 text-sm text-neutral-500">
-          <Spinner /> Thinking…
+        <div className="type-cursor text-sm uppercase tracking-wider text-muted">
+          {message.status ?? "Thinking"}
         </div>
       ) : (
-        <div className="markdown text-sm leading-relaxed text-foreground">
+        <div data-answer className="markdown text-sm leading-relaxed text-foreground">
           <ReactMarkdown remarkPlugins={[remarkGfm]} components={MD}>
             {message.content}
           </ReactMarkdown>
         </div>
       )}
 
+      {!message.streaming && provenance && <ProvenanceBadge provenance={provenance} />}
+
       {message.sources && message.sources.length > 0 && (
-        <div className="space-y-1 border-l-2 border-neutral-200 pl-3 text-xs text-neutral-500 dark:border-neutral-800">
-          <div className="font-semibold uppercase tracking-wide">Sources</div>
+        <div className="space-y-1 border-t border-dashed border-rule pt-2 text-xs text-muted">
+          <div className="font-display uppercase tracking-[0.2em]">References</div>
           <ol className="space-y-0.5">
-            {message.sources.map((s) => (
-              <li key={s.n}>
-                <span className="text-neutral-400">[{s.n}]</span>{" "}
-                {s.section_path.join(" › ") || s.chapter_title}
-                {s.page_start != null && (
-                  <span className="text-neutral-400">
-                    {" "}· p.{s.page_start}
-                    {s.page_end != null && s.page_end !== s.page_start ? `–${s.page_end}` : ""}
-                  </span>
-                )}
-              </li>
-            ))}
+            {message.sources.map((s) =>
+              s.type === "web" ? (
+                <li key={s.n}>
+                  <span className="text-muted/70">[{s.n}]</span>{" "}
+                  <a
+                    href={s.url ?? undefined}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="text-ink-blue hover:underline"
+                  >
+                    {s.title || s.url}
+                  </a>
+                  <span className="text-muted/70"> · web</span>
+                </li>
+              ) : (
+                <li key={s.n}>
+                  <span className="text-muted/70">[{s.n}]</span>{" "}
+                  {(s.section_path ?? []).join(" › ") || s.chapter_title}
+                  {s.page_start != null && (
+                    <span className="text-muted/70">
+                      {" "}· p.{s.page_start}
+                      {s.page_end != null && s.page_end !== s.page_start ? `–${s.page_end}` : ""}
+                    </span>
+                  )}
+                </li>
+              )
+            )}
           </ol>
         </div>
       )}
@@ -263,6 +451,43 @@ function formatCost(usd: number): string {
   return `$${usd.toPrecision(2)}`;
 }
 
+// Where the answer actually drew from, based on the sources it CITED ([n] markers) —
+// not merely what was retrieved. Falls back to all supplied sources if the answer has
+// no citation markers. Returns null when there are no sources (smalltalk / off-topic).
+type Provenance = "book" | "web" | "mixed";
+
+function answerProvenance(message: ChatMessage): Provenance | null {
+  const sources = message.sources;
+  if (!sources || sources.length === 0) return null;
+  const cited = new Set(
+    [...message.content.matchAll(/\[(\d+)\]/g)].map((m) => Number(m[1])),
+  );
+  const relevant = cited.size > 0 ? sources.filter((s) => cited.has(s.n)) : sources;
+  const scope = relevant.length > 0 ? relevant : sources;
+  const hasWeb = scope.some((s) => s.type === "web");
+  const hasBook = scope.some((s) => s.type !== "web"); // undefined type = book
+  if (hasWeb && hasBook) return "mixed";
+  if (hasWeb) return "web";
+  return "book";
+}
+
+// Stamp-pad ink colors: red for the book, fountain-pen blue for the web,
+// office violet for both.
+const PROVENANCE_META: Record<Provenance, { label: string; className: string }> = {
+  book: { label: "From the textbook", className: "text-stamp-red" },
+  web: { label: "From the web", className: "text-ink-blue" },
+  mixed: { label: "Textbook + web", className: "text-stamp-violet" },
+};
+
+function ProvenanceBadge({ provenance }: { provenance: Provenance }) {
+  const { label, className } = PROVENANCE_META[provenance];
+  return (
+    <span className={`stamp inline-flex items-center text-[11px] ${className}`}>
+      {label}
+    </span>
+  );
+}
+
 // Markdown element styling (no typography plugin needed).
 const MD = {
   p: (props: React.HTMLAttributes<HTMLParagraphElement>) => <p className="mb-3 last:mb-0" {...props} />,
@@ -270,13 +495,13 @@ const MD = {
   ul: (props: React.HTMLAttributes<HTMLUListElement>) => <ul className="mb-3 list-disc space-y-1 pl-5" {...props} />,
   li: (props: React.LiHTMLAttributes<HTMLLIElement>) => <li className="pl-1" {...props} />,
   strong: (props: React.HTMLAttributes<HTMLElement>) => <strong className="font-semibold" {...props} />,
-  h1: (props: React.HTMLAttributes<HTMLHeadingElement>) => <h1 className="mb-2 mt-4 text-lg font-bold" {...props} />,
-  h2: (props: React.HTMLAttributes<HTMLHeadingElement>) => <h2 className="mb-2 mt-4 text-base font-bold" {...props} />,
-  h3: (props: React.HTMLAttributes<HTMLHeadingElement>) => <h3 className="mb-1 mt-3 font-semibold" {...props} />,
+  h1: (props: React.HTMLAttributes<HTMLHeadingElement>) => <h1 className="mb-2 mt-4 font-display text-lg" {...props} />,
+  h2: (props: React.HTMLAttributes<HTMLHeadingElement>) => <h2 className="mb-2 mt-4 font-display text-base" {...props} />,
+  h3: (props: React.HTMLAttributes<HTMLHeadingElement>) => <h3 className="mb-1 mt-3 font-display" {...props} />,
   code: (props: React.HTMLAttributes<HTMLElement>) => (
-    <code className="rounded bg-neutral-200 px-1 py-0.5 font-mono text-[0.85em] dark:bg-neutral-800" {...props} />
+    <code className="rounded-none border border-rule bg-card px-1 py-0.5 font-mono text-[0.85em]" {...props} />
   ),
-  a: (props: React.AnchorHTMLAttributes<HTMLAnchorElement>) => <a className="underline" {...props} />,
+  a: (props: React.AnchorHTMLAttributes<HTMLAnchorElement>) => <a className="text-ink-blue underline" {...props} />,
 };
 
 function ThemeToggle({ dark, onToggle }: { dark: boolean; onToggle: () => void }) {
@@ -288,10 +513,10 @@ function ThemeToggle({ dark, onToggle }: { dark: boolean; onToggle: () => void }
         role="switch"
         aria-checked={dark}
         aria-label="Toggle dark mode"
-        className="inline-flex h-6 w-11 items-center rounded-full bg-neutral-300 px-0.5 transition-colors dark:bg-neutral-600"
+        className="inline-flex h-6 w-11 items-center rounded-full border border-foreground/30 bg-rule px-0.5 transition-colors"
       >
         <span
-          className={`h-5 w-5 rounded-full bg-white shadow transition-transform ${
+          className={`h-4.5 w-4.5 rounded-full border border-foreground/40 bg-card shadow transition-transform ${
             dark ? "translate-x-5" : "translate-x-0"
           }`}
         />
@@ -312,9 +537,25 @@ function SendIcon() {
   );
 }
 
+function QuoteIcon() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" className="shrink-0 opacity-70">
+      <path d="M7 7h4v6a4 4 0 0 1-4 4H6v-2h1a2 2 0 0 0 2-2v-1H7Zm8 0h4v6a4 4 0 0 1-4 4h-1v-2h1a2 2 0 0 0 2-2v-1h-2Z" />
+    </svg>
+  );
+}
+
+function CloseIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M18 6 6 18M6 6l12 12" />
+    </svg>
+  );
+}
+
 function SunIcon() {
   return (
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-neutral-500">
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-muted">
       <circle cx="12" cy="12" r="4" />
       <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41" />
     </svg>
@@ -323,17 +564,8 @@ function SunIcon() {
 
 function MoonIcon() {
   return (
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-neutral-500">
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-muted">
       <path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z" />
-    </svg>
-  );
-}
-
-function Spinner() {
-  return (
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" className="animate-spin">
-      <circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth="2" strokeOpacity="0.25" />
-      <path d="M21 12a9 9 0 0 0-9-9" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
     </svg>
   );
 }

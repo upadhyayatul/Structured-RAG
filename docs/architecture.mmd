@@ -1,0 +1,125 @@
+%%{init: {"flowchart": {"htmlLabels": true, "curve": "basis"}, "themeVariables": {"fontFamily": "Segoe UI, Arial, sans-serif"}}}%%
+flowchart TB
+  classDef store fill:#fef3c7,stroke:#d97706,color:#7c2d12;
+  classDef gate fill:#fee2e2,stroke:#dc2626,color:#7f1d1d;
+  classDef gw fill:#ede9fe,stroke:#7c3aed,color:#4c1d95;
+  classDef ext fill:#e0f2fe,stroke:#0284c7,color:#075985;
+  classDef proc fill:#f1f5f9,stroke:#64748b,color:#1e293b;
+  classDef router fill:#dcfce7,stroke:#16a34a,color:#14532d;
+
+  %% ---------------- Phase 1: Indexing (offline) ----------------
+  subgraph INDEX["Phase 1 · Indexing pipeline (offline, once per book)"]
+    direction TB
+    PDF["Laxmikanth PDF<br/>~1500 pages"]:::proc
+    PARSE["parsing/<br/>PyMuPDF · TOC tree · align TOC → body"]:::proc
+    CHUNK["chunking/<br/>split inside sections<br/>parent (full) + child (~600 tok, overlap)"]:::proc
+    ENRICH["enrichment/<br/>Article entities · syllabus tags<br/>chapter Article catalog"]:::proc
+    EMBED["indexing/<br/>embed CHILDREN<br/>(dense vectors → Qdrant)"]:::proc
+    PDF --> PARSE --> CHUNK --> ENRICH --> EMBED
+    EMBED --> JSONL[("chunks.jsonl<br/>parent + child")]:::store
+    EMBED --> QDRANT[("Qdrant<br/>collection: upsc_polity")]:::store
+  end
+
+  %% ---------------- Phase 2: Serving (online) ----------------
+  subgraph SERVE["Phase 2 · Query serving (online, per request)"]
+    direction TB
+    UI["Browser · Next.js chat (web/)"]:::proc
+    BFF["BFF proxy · app/api/ask/route.ts<br/>pipes NDJSON: status · sources · token · done"]:::proc
+    API["FastAPI · api/app.py<br/>/ask · /ask/stream · /health<br/>condenses follow-ups with chat history"]:::proc
+    ORCH{"Orchestration backend<br/>UPSC_RAG_PIPELINE"}:::gate
+    GROUTER{{"LangGraph router · graph/build.py<br/>compiled state machine<br/>conditional edges on 'route'"}}:::router
+    UI --> BFF --> API --> ORCH
+
+    %% direct + graph share the same steps
+    subgraph DG["Request steps (shared by direct + graph)"]
+      direction TB
+      SMALL{"smalltalk gate"}:::gate
+      RET["HybridRetriever<br/>dense + BM25 → RRF → rerank → catalog"]:::proc
+      OFF{"off-topic gate"}:::gate
+      SUFF{"sufficiency check<br/>do the sections answer it?"}:::gate
+      WEBFB["web fallback · retrieval/web.py<br/>web_search → DuckDuckGo (ddgs)"]:::proc
+      GEN["generate_answer<br/>grounded + cited [n]"]:::proc
+      GENW["generate_agentic_answer<br/>textbook + web, cited"]:::proc
+      SMALL -->|chit-chat| CANNED["canned reply"]:::proc
+      SMALL -->|answer| RET --> OFF
+      OFF -->|below floor| OOS["out-of-scope reply"]:::proc
+      OFF -->|in-scope| SUFF
+      SUFF -->|sufficient| GEN
+      SUFF -->|"insufficient (post-2011 / not in book)"| WEBFB --> GENW
+    end
+
+    %% agentic ReAct path
+    subgraph AG["agentic (ReAct tool-calling)"]
+      direction TB
+      ASMALL{"smalltalk gate"}:::gate
+      DOM{"polity domain gate"}:::gate
+      AGENT["agent (ReAct loop)<br/>LLM picks tools, max 4 iters"]:::proc
+      TOOLS["tools node"]:::proc
+      TB_TOOL["SearchTextbook<br/>→ HybridRetriever"]:::proc
+      WEB_TOOL["WebSearch<br/>→ DuckDuckGo (ddgs)"]:::proc
+      SYN["synthesize<br/>generate_agentic_answer<br/>book + web, cited"]:::proc
+      ASMALL -->|answer| DOM
+      DOM -->|off-topic| AOOS["out-of-scope reply"]:::proc
+      DOM -->|polity| AGENT
+      AGENT <-->|gather| TOOLS
+      TOOLS --> TB_TOOL
+      TOOLS --> WEB_TOOL
+      AGENT -->|done| SYN
+    end
+
+    ORCH -->|direct| SMALL
+    ORCH -->|graph| GROUTER --> SMALL
+    ORCH -->|agentic| ASMALL
+    GEN --> UI
+    GENW --> UI
+    SYN --> UI
+  end
+
+  %% ---------------- AI gateway + providers ----------------
+  subgraph PROV["Model providers"]
+    direction TB
+    GATEWAY["LiteLLM proxy · AI gateway<br/>UPSC_RAG_LLM_GATEWAY=litellm<br/>cost · keys · fallbacks (chat only)"]:::gw
+    OPENAI_CHAT["OpenAI · chat"]:::ext
+    OPENAI_EMB["OpenAI · embeddings"]:::ext
+    GATEWAY --> OPENAI_CHAT
+  end
+
+  %% ---------------- Observability ----------------
+  subgraph OBS["Observability (Langfuse)"]
+    direction TB
+    LF["Langfuse · unified 'ask' root trace<br/>spans: rewrite · retrieve · sufficiency · web_search · generate<br/>live scores after the 'done' event (never blocks the stream):<br/>groundedness · citations · used_web"]:::gw
+  end
+
+  %% ---------------- Evaluation ----------------
+  subgraph EVAL["Evaluation (offline harnesses · data/eval gold set)"]
+    direction TB
+    GOLD[("gold set · 70 labeled Qs")]:::store
+    RQ["retrieval quality<br/>hit@k · MRR · article_recall"]:::proc
+    CQ["cheap gen signals<br/>citation · groundedness · relevance"]:::proc
+    JQ["LLM-as-judge<br/>faithfulness · completeness · exam · citation"]:::proc
+    GOLD --> RQ
+    GOLD --> CQ
+    GOLD --> JQ
+  end
+
+  %% ---------------- cross-cutting edges ----------------
+  QDRANT -.->|dense vector search| RET
+  JSONL  -.->|BM25 corpus + parent text| RET
+  QDRANT -.-> TB_TOOL
+
+  %% chat calls route via gateway (or direct when off)
+  GEN -.->|chat| GATEWAY
+  GENW -.->|chat| GATEWAY
+  SYN -.->|chat| GATEWAY
+  AGENT -.->|chat| GATEWAY
+  DOM  -.->|chat| GATEWAY
+  SUFF -.->|chat| GATEWAY
+  RET  -.->|"query rewrite (chat)"| GATEWAY
+  API  -.->|"condense follow-up (chat)"| GATEWAY
+
+  %% every /ask request emits one root trace with per-step spans + scores
+  API -.->|"traces + scores"| LF
+
+  %% embeddings ALWAYS go direct (never through the gateway)
+  RET -.->|query embedding| OPENAI_EMB
+  EMBED -.->|corpus embedding| OPENAI_EMB

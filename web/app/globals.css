@@ -4,24 +4,103 @@
    instead of the OS preference. */
 @custom-variant dark (&:where(.dark, .dark *));
 
+/* Government-office dossier theme.
+   Light = daylight desk (aged manila paper), dark = night desk (dark sepia). */
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --background: #ece1c4;
+  --card: #f4ecd8;
+  --foreground: #2b2417;
+  --muted: #6f6349;
+  --rule: #c9b98f;
+  --stamp-red: #a33327;
+  --ink-blue: #1f4e79;
+  --stamp-violet: #6b4d8f;
 }
 
 .dark {
-  --background: #0a0a0a;
-  --foreground: #ededed;
+  --background: #211c12;
+  --card: #2b2517;
+  --foreground: #e6dabb;
+  --muted: #a5977a;
+  --rule: #4a3f2a;
+  --stamp-red: #d0574a;
+  --ink-blue: #7da7cc;
+  --stamp-violet: #a98cc9;
 }
 
 @theme inline {
   --color-background: var(--background);
+  --color-card: var(--card);
   --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+  --color-muted: var(--muted);
+  --color-rule: var(--rule);
+  --color-stamp-red: var(--stamp-red);
+  --color-ink-blue: var(--ink-blue);
+  --color-stamp-violet: var(--stamp-violet);
+  --font-sans: var(--font-courier-prime);
+  --font-mono: var(--font-courier-prime);
+  --font-display: var(--font-special-elite);
 }
 
 body {
   background: var(--background);
   color: var(--foreground);
+  /* Faint paper grain: two offset dot lattices, too subtle to read as a pattern. */
+  background-image:
+    radial-gradient(color-mix(in srgb, var(--foreground) 5%, transparent) 1px, transparent 1px),
+    radial-gradient(color-mix(in srgb, var(--foreground) 3%, transparent) 1px, transparent 1px);
+  background-size: 7px 7px, 11px 11px;
+  background-position: 0 0, 4px 6px;
+}
+
+/* Rubber stamp: the theme's one loud element. Double border, tilted, uneven ink. */
+.stamp {
+  font-family: var(--font-special-elite);
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  border: 2px solid currentColor;
+  outline: 1px solid currentColor;
+  outline-offset: 2px;
+  padding: 0.2rem 0.65rem;
+  transform: rotate(-3deg);
+  /* Patchy ink coverage, like a half-dry stamp pad. */
+  mask-image: radial-gradient(
+    ellipse at 62% 38%,
+    black 46%,
+    rgba(0, 0, 0, 0.82) 74%,
+    rgba(0, 0, 0, 0.62) 100%
+  );
+  animation: stamp-in 180ms ease-out;
+}
+
+@keyframes stamp-in {
+  from {
+    transform: rotate(-3deg) scale(1.6);
+    opacity: 0;
+  }
+  to {
+    transform: rotate(-3deg) scale(1);
+    opacity: 1;
+  }
+}
+
+/* Blinking typewriter cursor for the "thinking" state. */
+.type-cursor::after {
+  content: "▍";
+  animation: cursor-blink 1s steps(1) infinite;
+}
+
+@keyframes cursor-blink {
+  50% {
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .stamp {
+    animation: none;
+  }
+  .type-cursor::after {
+    animation: none;
+  }
 }
