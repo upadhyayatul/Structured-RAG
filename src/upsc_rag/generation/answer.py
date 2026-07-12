@@ -1,6 +1,7 @@
 """Prompt builder and LLM call for grounded, source-cited answers from retrieved chunks."""
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Iterator
 
 from openai import OpenAI
@@ -112,6 +113,29 @@ _AGENTIC_SYSTEM_PROMPT = (
 )
 
 
+def _agentic_system_prompt() -> str:
+    """The agentic system prompt, stamped with today's date.
+
+    Web pages are undated in a snippet and are frequently years stale. Without knowing the
+    date, the model reads "Justice Khanna will take over from CJI Chandrachud on November
+    11" as a FUTURE event and reports Chandrachud as the sitting CJI — which is how a
+    faithfully-grounded answer still comes out wrong. The date is what lets it recognise
+    that such a source has expired.
+    """
+    today = datetime.now().strftime("%d %B %Y")
+    return (
+        _AGENTIC_SYSTEM_PROMPT + "\n\n"
+        f"TODAY'S DATE IS {today}. Web sources carry no publication date and are often "
+        "years out of date. Read every 'current'/'incumbent' claim against today's date: "
+        "if a source says an appointment 'will' happen, or calls someone the incumbent, "
+        "and that date is already in the PAST, the source has EXPIRED — the person it "
+        "names may since have left office. Never present a former office-holder as the "
+        "current one. Where the sources disagree, follow the one most consistent with "
+        "today's date; where they only show an expired position, say plainly that the "
+        "sources appear out of date rather than naming a stale holder as current."
+    )
+
+
 def build_agentic_prompt(
     query: str,
     contexts: list[dict[str, Any]],
@@ -170,6 +194,7 @@ def generate_agentic_answer(
     session_id: str | None = None,
     usage_sink: dict[str, Any] | None = None,
     history: list[dict[str, Any]] | None = None,
+    parent: Any = None,
 ) -> str:
     """Synthesize a grounded, cited answer over combined textbook + web sources."""
     gen_cfg = cfg.get("generation", {})
@@ -177,13 +202,14 @@ def generate_agentic_answer(
     model = gen_cfg.get("model", "gpt-4o-mini")
     hist = _history_messages(history, cfg.get("conversation", {}).get("history_turns", 3))
     messages = [
-        {"role": "system", "content": _AGENTIC_SYSTEM_PROMPT},
+        {"role": "system", "content": _agentic_system_prompt()},
         *hist,
         {"role": "user", "content": build_agentic_prompt(query, contexts, web)},
     ]
 
-    with trace_manager.trace(
+    with trace_manager.start(
         "agentic_answer",
+        parent=parent,
         input={"query": query, "num_book": len(contexts), "num_web": len(web)},
         session_id=session_id,
     ) as trace:
@@ -219,6 +245,7 @@ def generate_agentic_answer_stream(
     session_id: str | None = None,
     usage_sink: dict[str, Any] | None = None,
     history: list[dict[str, Any]] | None = None,
+    parent: Any = None,
 ) -> Iterator[str]:
     """Stream the synthesized answer over combined textbook + web sources."""
     gen_cfg = cfg.get("generation", {})
@@ -226,13 +253,14 @@ def generate_agentic_answer_stream(
     model = gen_cfg.get("model", "gpt-4o-mini")
     hist = _history_messages(history, cfg.get("conversation", {}).get("history_turns", 3))
     messages = [
-        {"role": "system", "content": _AGENTIC_SYSTEM_PROMPT},
+        {"role": "system", "content": _agentic_system_prompt()},
         *hist,
         {"role": "user", "content": build_agentic_prompt(query, contexts, web)},
     ]
 
-    with trace_manager.trace(
+    with trace_manager.start(
         "agentic_answer",
+        parent=parent,
         input={"query": query, "num_book": len(contexts), "num_web": len(web)},
         session_id=session_id,
     ) as trace:
@@ -324,6 +352,7 @@ def generate_answer(
     session_id: str | None = None,
     usage_sink: dict[str, Any] | None = None,
     history: list[dict[str, Any]] | None = None,
+    parent: Any = None,
 ) -> str:
     """
     Build the grounded prompt and call the LLM to produce a cited answer.
@@ -345,8 +374,9 @@ def generate_answer(
         {"role": "user", "content": prompt},
     ]
 
-    with trace_manager.trace(
+    with trace_manager.start(
         "answer",
+        parent=parent,
         input={"query": query, "num_sources": len(contexts), "num_history": len(hist)},
         session_id=session_id,
     ) as trace:
@@ -381,6 +411,7 @@ def generate_answer_stream(
     session_id: str | None = None,
     usage_sink: dict[str, Any] | None = None,
     history: list[dict[str, Any]] | None = None,
+    parent: Any = None,
 ) -> Iterator[str]:
     """Yield the answer text incrementally as the LLM streams tokens.
 
@@ -397,8 +428,9 @@ def generate_answer_stream(
         {"role": "user", "content": build_answer_prompt(query, contexts)},
     ]
 
-    with trace_manager.trace(
+    with trace_manager.start(
         "answer",
+        parent=parent,
         input={"query": query, "num_sources": len(contexts), "num_history": len(hist)},
         session_id=session_id,
     ) as trace:

@@ -42,7 +42,10 @@ flowchart LR
 
 > 📐 **Full diagrams:** see [`docs/architecture.md`](docs/architecture.md) for editable Mermaid
 > diagrams — a system overview (indexing · serving · evaluation) and the detailed multi-query
-> retrieval flow (gated rewrite + RRF fusion). `docs/architecture.svg` is a static render.
+> retrieval flow (gated rewrite + RRF fusion). The whole-system diagram is also kept as a
+> standalone Mermaid source, [`docs/architecture.mmd`](docs/architecture.mmd), rendered to
+> [`docs/architecture-mermaid.svg`](docs/architecture-mermaid.svg) (regenerate with
+> `npx @mermaid-js/mermaid-cli -i docs/architecture.mmd -o docs/architecture-mermaid.svg`).
 
 ```
 Browser (Next.js chat)            FastAPI (Python)               Services
@@ -58,9 +61,19 @@ The Next.js route handler (`web/app/api/ask/route.ts`) is a same-origin proxy th
 
 ### Orchestration backends
 
-The request flow (smalltalk gate → retrieve → relevance gate → generate) ships in two
-interchangeable forms behind an env flag — the default keeps the original direct code path,
-and graph mode runs the same steps as a **LangGraph** state machine:
+The request flow (smalltalk gate → retrieve → relevance gate → generate) ships in **three**
+interchangeable forms behind the `UPSC_RAG_PIPELINE` env flag — the default keeps the original
+direct code path, `graph` runs the same steps as a **LangGraph** state machine, and `agentic`
+is a tool-calling **ReAct** agent. All three reuse the same `HybridRetriever` + `generate_answer`,
+so retrieval/generation behavior (and the eval numbers) are unchanged; only orchestration differs.
+
+| `UPSC_RAG_PIPELINE` | What it does |
+|---------------------|--------------|
+| *(unset)* / `direct` | FastAPI calls the functions directly (default) |
+| `graph` | A compiled **LangGraph** state machine wraps the same functions as thin nodes |
+| `agentic` | A **ReAct** loop where the LLM chooses per polity question between the textbook (`HybridRetriever`) and **DuckDuckGo web search** (`retrieval/web.py`) — gated so only polity queries reach the tools; web may answer standalone for post-2011 topics the 2011 book can't cover |
+
+The direct vs graph paths run identical steps:
 
 ```
 default                                   UPSC_RAG_PIPELINE=graph
@@ -81,10 +94,38 @@ optional `UPSC_RAG_LLM_BACKEND=langchain` flag routes generation through `ChatOp
 the `orchestration` stage in `progress.json`.
 
 ```powershell
-# run the backend on the LangGraph path
+# run the backend on the LangGraph path (or "agentic" for the ReAct + web-search agent)
 $env:UPSC_RAG_PIPELINE = "graph"
 python -m uvicorn upsc_rag.api.app:app --reload --port 8000
 ```
+
+### AI gateway (LiteLLM)
+
+Every **chat** call the app makes (answer generation, query rewrite, history condense, the
+agentic domain gate + tool router, and the LLM judge) can be routed through a self-hosted
+**[LiteLLM](https://github.com/BerriAI/litellm) proxy** — an OpenAI-compatible gateway for
+central cost tracking, virtual keys, provider fallbacks, and one-place model swaps. It's
+**off by default** (direct OpenAI, so eval numbers are unchanged); set `UPSC_RAG_LLM_GATEWAY=litellm`
+to turn it on. **Embeddings never go through it** — they stay on the direct OpenAI endpoint
+(dimension-locked to the Qdrant collection).
+
+A single factory, `get_openai_client()` in `llm/clients.py`, is the seam: it returns a client
+pointed at the proxy when the gateway is enabled, or a direct OpenAI client when it isn't, so no
+call site changes. Model aliases in `litellm/config.yaml` mirror the model names in
+`config/default.yaml`, so the app passes the same names either way.
+
+```powershell
+# start the proxy (+ Qdrant) via docker-compose; config in litellm/config.yaml
+docker-compose up -d qdrant-db litellm      # gateway + admin UI at http://localhost:4000
+
+# enable it for the app (.env): UPSC_RAG_LLM_GATEWAY=litellm
+#   LITELLM_BASE_URL=http://localhost:4000
+#   LITELLM_API_KEY=<same value as the proxy's LITELLM_MASTER_KEY>
+```
+
+> The proxy's **admin UI / virtual-key / spend storage** needs a Postgres (the `litellm-db`
+> service in `docker-compose.yml`); routing chat calls does not. Log in at `/ui` with
+> `admin` + the master key.
 
 ---
 
@@ -95,6 +136,7 @@ Prereqs: Python 3.13 venv, Node 18+, Docker (for Qdrant), and an `OPENAI_API_KEY
 ```powershell
 # 1. Start Qdrant (vector DB)
 docker run -d -p 6333:6333 -v qdrant_storage:/qdrant/storage --name qdrant qdrant/qdrant
+#    or: docker-compose up -d qdrant-db   (compose also offers Langfuse + the LiteLLM gateway)
 
 # 2. Build the index (once): parse + chunk, then embed + upsert
 python scripts/ingest.py --book laxmikanth_6
@@ -124,10 +166,15 @@ Structured-RAG/
 ├── progress.json             # Stage-by-stage status (source of truth)
 ├── CLAUDE.md                 # Quick reference for the codebase
 ├── README.md                 # This file
+├── docker-compose.yml        # Qdrant + Langfuse + LiteLLM proxy (+ its Postgres)
+├── litellm/
+│   └── config.yaml           # LiteLLM proxy model routes (AI gateway; off by default)
 │
 ├── docs/
 │   ├── architecture.md       # Mermaid diagrams: system overview + multi-query retrieval
-│   └── architecture.svg      # Static end-to-end render
+│   ├── architecture.mmd      # Whole-system Mermaid source (edit this)
+│   ├── architecture-mermaid.svg  # Rendered from architecture.mmd
+│   └── architecture.svg      # Older hand-drawn static render
 │
 ├── config/
 │   ├── default.yaml          # Global defaults (chunking, indexing, retrieval, generation)
@@ -153,10 +200,11 @@ Structured-RAG/
 │   ├── chunking/             # Hierarchy-aware splitting
 │   ├── enrichment/           # syllabus_tags, entities
 │   ├── indexing/             # JSONL store, OpenAI embedder, Qdrant store
-│   ├── retrieval/            # HybridRetriever (dense + BM25 + RRF), rewrite, cross-encoder rerank
-│   ├── generation/           # build_answer_prompt, generate_answer[_stream], sources (dedupe)
+│   ├── retrieval/            # HybridRetriever (dense + BM25 + RRF), rewrite, cross-encoder rerank, web.py (DuckDuckGo)
+│   ├── generation/           # build_answer_prompt, generate_answer[_stream], condense, agentic synthesis, sources (dedupe)
 │   ├── graph/                # LangGraph orchestration (UPSC_RAG_PIPELINE=graph): state, nodes, build, runner
-│   ├── llm/                  # ChatOpenAI/OpenAIEmbeddings adapters (optional portability seam)
+│   ├── agent/                # Agentic ReAct pipeline (UPSC_RAG_PIPELINE=agentic): tools, nodes, build, runner
+│   ├── llm/                  # clients.py — get_openai_client() gateway factory + ChatOpenAI/OpenAIEmbeddings seam
 │   ├── api/                  # FastAPI app (/ask, /ask/stream, /health)
 │   ├── eval/                 # retrieval-quality harness (hit@k, MRR, article_recall)
 │   └── pipeline/             # run_ingest, run_embed orchestration

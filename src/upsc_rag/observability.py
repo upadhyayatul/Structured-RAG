@@ -25,6 +25,7 @@ class _NoopSpan:
     def end(self, **kwargs: Any) -> None: ...
     def span(self, name: str, **kwargs: Any) -> "_NoopContext": ...  # type: ignore[empty-body]
     def generation(self, name: str, **kwargs: Any) -> "_NoopContext": ...  # type: ignore[empty-body]
+    def score(self, name: str, value: float, comment: str | None = None) -> None: ...
 
 
 class _NoopContext:
@@ -36,6 +37,7 @@ class _NoopContext:
         return _NoopContext()
     def generation(self, name: str, **kwargs: Any) -> "_NoopContext":
         return _NoopContext()
+    def score(self, name: str, value: float, comment: str | None = None) -> None: ...
 
 
 class _LangfuseSpanContext:
@@ -70,6 +72,14 @@ class _LangfuseSpanContext:
 
     def generation(self, name: str, **kwargs: Any) -> "_LangfuseSpanContext":
         return _LangfuseSpanContext(self._span.generation(name=name, **kwargs))
+
+    def score(self, name: str, value: float, comment: str | None = None) -> None:
+        """Attach a numeric score. On a root trace this is a trace-level score;
+        on a span/generation it scores that observation. Silently skips if the
+        wrapped object has no ``.score`` (older SDK / unexpected object)."""
+        fn = getattr(self._span, "score", None)
+        if callable(fn):
+            fn(name=name, value=value, comment=comment)
 
     @property
     def elapsed_ms(self) -> float:
@@ -118,6 +128,49 @@ class TraceManager:
         finally:
             if self._client:
                 self._client.flush()
+
+    @contextmanager
+    def start(
+        self,
+        name: str,
+        *,
+        parent: "_LangfuseSpanContext | _NoopContext | None" = None,
+        input: dict[str, Any] | None = None,
+        session_id: str | None = None,
+        **kwargs: Any,
+    ) -> Generator[_LangfuseSpanContext | _NoopContext, None, None]:
+        """Open ``name`` as a child span of ``parent``, or as a root trace if none.
+
+        Lets a stage nest under a request-level root trace (one question = one trace
+        with rolled-up cost/latency) while still working standalone (own root trace)
+        when called without a parent — e.g. from scripts or eval. A child span does
+        not flush; the root trace flushes once when it closes.
+        """
+        if parent is not None:
+            with parent.span(name, input=input or {}, **kwargs) as span:
+                yield span
+            return
+        with self.trace(name, input=input, session_id=session_id, **kwargs) as t:
+            yield t
+
+    def open_root(
+        self,
+        name: str,
+        *,
+        input: dict[str, Any] | None = None,
+        session_id: str | None = None,
+        **kwargs: Any,
+    ) -> _LangfuseSpanContext | _NoopContext:
+        """Return a root trace context WITHOUT the auto-flush context manager.
+
+        For callers whose root must outlive a ``with`` block — e.g. the streaming
+        handler, where retrieval runs before the response generator and generation
+        runs inside it. The caller owns the lifetime: call ``root.end(...)`` and
+        ``trace_manager.flush()`` in a ``finally``.
+        """
+        if not self._enabled:
+            return _NoopContext()
+        return _LangfuseSpanContext(self._client.trace(name=name, input=input or {}, session_id=session_id, **kwargs))
 
     def flush(self) -> None:
         if self._enabled and self._client:

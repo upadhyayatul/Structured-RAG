@@ -15,6 +15,7 @@ interface ChatMessage {
   totalTokens?: number;
   streaming?: boolean;
   error?: boolean;
+  status?: string; // pipeline stage being waited on ("Searching the textbook…"), until the first token
 }
 
 // A live text selection inside an assistant answer, plus where to float the button.
@@ -160,12 +161,16 @@ export default function Home() {
         for (const line of lines) {
           if (!line.trim()) continue;
           const evt = JSON.parse(line);
-          if (evt.type === "sources") {
+          if (evt.type === "status") {
+            // What the backend is doing right now — shown in place of "Thinking…".
+            patchLast({ status: evt.label as string });
+          } else if (evt.type === "sources") {
             patchLast({ sources: evt.sources as Source[] });
           } else if (evt.type === "token") {
             if (ttft === null) {
               ttft = performance.now() - start;
-              patchLast({ ttftMs: ttft });
+              // The answer is arriving, so the stage caption has done its job.
+              patchLast({ ttftMs: ttft, status: undefined });
             }
             answer += evt.text;
             patchLast({ content: answer });
@@ -382,7 +387,7 @@ function AssistantMessage({ message }: { message: ChatMessage }) {
 
       {waiting ? (
         <div className="flex items-center gap-2 text-sm text-neutral-500">
-          <Spinner /> Thinking…
+          <Spinner /> {message.status ?? "Thinking…"}
         </div>
       ) : (
         <div data-answer className="markdown text-sm leading-relaxed text-foreground">

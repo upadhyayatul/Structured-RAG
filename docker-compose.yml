@@ -63,12 +63,33 @@ services:
       LANGFUSE_INIT_USER_NAME: "dev"
       LANGFUSE_INIT_USER_PASSWORD: "localdevpassword"
 
+  litellm-db:
+    # Postgres backing the LiteLLM proxy. Required only for the Admin UI + virtual-key /
+    # spend storage — routing chat calls works without it. Separate DB from Langfuse's.
+    image: postgres:15
+    container_name: litellm-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: litellm
+      POSTGRES_PASSWORD: litellm
+      POSTGRES_DB: litellm
+    volumes:
+      - litellm_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U litellm"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   litellm:
     # OpenAI-compatible AI gateway. Fronts every CHAT call the app makes (not embeddings).
     # Enable in the app with UPSC_RAG_LLM_GATEWAY=litellm + LITELLM_BASE_URL/LITELLM_API_KEY.
     image: ghcr.io/berriai/litellm:main-stable
     container_name: litellm
     restart: unless-stopped
+    depends_on:
+      litellm-db:
+        condition: service_healthy
     ports:
       - "4000:4000"   # OpenAI-compatible endpoint (base_url = http://localhost:4000)
     volumes:
@@ -79,9 +100,14 @@ services:
       # clients present to the proxy. Supply both via .env (compose reads it automatically).
       OPENAI_API_KEY: "${OPENAI_API_KEY}"
       LITELLM_MASTER_KEY: "${LITELLM_MASTER_KEY}"
+      # Enables the Admin UI (http://localhost:4000/ui) + virtual-key / spend storage.
+      # LiteLLM auto-runs its schema migrations on startup. Login: admin / <master key>.
+      DATABASE_URL: "postgresql://litellm:litellm@litellm-db:5432/litellm"
+      STORE_MODEL_IN_DB: "True"
 
 volumes:
   langfuse_db_data:
+  litellm_db_data:
   # Adopt the existing, already-populated Qdrant volume (created via `docker run`)
   # rather than letting Compose create a new prefixed one — preserves upsc_polity.
   qdrant_storage:

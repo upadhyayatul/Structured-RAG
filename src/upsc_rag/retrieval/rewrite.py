@@ -17,8 +17,9 @@ from upsc_rag.observability import NOOP_CONTEXT
 _REWRITE_SYSTEM = (
     "You rewrite a user's question into search queries for an Indian Polity "
     "(M. Laxmikanth) textbook index. Expand abbreviations (SC -> Supreme Court, "
-    "HC -> High Court, FR -> Fundamental Rights, DPSP -> Directive Principles, "
-    "PM -> Prime Minister, CJI -> Chief Justice of India), and replace colloquial "
+    "HC -> High Court, FR -> Fundamental Rights, FD -> Fundamental Duties, "
+    "DPSP -> Directive Principles, PM -> Prime Minister, CJI -> Chief Justice of "
+    "India), and replace colloquial "
     "verbs with the book's formal terminology (selected/chosen/nominated -> "
     "appointed/appointment; fired/sacked -> removed/removal). Produce concise, "
     "keyword-rich variants that capture the same intent. "

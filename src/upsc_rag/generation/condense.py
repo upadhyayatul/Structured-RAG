@@ -3,8 +3,12 @@
 Retrieval embeds the query STRING alone, so a follow-up like "why was it created"
 (no subject) retrieves the wrong sections. Given the recent conversation, a small LLM
 rewrites it into a self-contained question ("Why was NITI Aayog created?") BEFORE
-retrieval runs. Generation still receives the raw history separately (see answer.py);
-this step only fixes the retrieval query.
+retrieval runs.
+
+The standalone question also feeds GENERATION (see api/app.py), so it must resolve
+abbreviations too: the answer LLM reading a raw "from where was the FD taken?" after a
+turn about Fundamental Rights will decode FD as Fundamental Rights and answer the wrong
+question, even when retrieval fetched the correct Fundamental Duties sources.
 """
 from __future__ import annotations
 
@@ -25,6 +29,13 @@ _CONDENSE_SYSTEM = (
     "- Output the SHORTEST self-contained question that preserves the original intent.\n"
     "- Substitute the referenced entity in place of the pronoun and change NOTHING "
     "else about the wording.\n"
+    "- Expand Indian-polity abbreviations to their full form (FD -> Fundamental Duties, "
+    "FR -> Fundamental Rights, DPSP -> Directive Principles of State Policy, "
+    "SC -> Supreme Court, HC -> High Court, PM -> Prime Minister, "
+    "CJI -> Chief Justice of India). Resolve the abbreviation on its own merits — do "
+    "NOT assume it refers to whatever topic the conversation was about (a question "
+    "about FD after a discussion of Fundamental Rights is still about Fundamental "
+    "DUTIES).\n"
     "- Do NOT answer it. Do NOT add explanations, context, framing, sources, or extra "
     "qualifiers (e.g. never append phrases like 'in the context of ...' or 'according "
     "to the textbook').\n"
@@ -51,6 +62,7 @@ def condense_query(
     client: OpenAI | None = None,
     model: str = "gpt-4.1-nano",
     session_id: str | None = None,
+    parent: Any = None,
 ) -> str:
     """Return a standalone version of ``query`` given the prior conversation turns.
 
@@ -73,8 +85,8 @@ def condense_query(
         },
     ]
     try:
-        with trace_manager.trace(
-            "condense", input={"query": query}, session_id=session_id
+        with trace_manager.start(
+            "condense", parent=parent, input={"query": query}, session_id=session_id
         ) as trace:
             gen = trace.generation(
                 "condense_llm",

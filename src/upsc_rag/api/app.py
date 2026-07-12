@@ -24,14 +24,21 @@ from pydantic import BaseModel, Field
 
 from upsc_rag.config import get_settings, load_runtime_config
 from upsc_rag.generation.answer import (
+    generate_agentic_answer,
     generate_agentic_answer_stream,
     generate_answer,
     generate_answer_stream,
 )
 from upsc_rag.generation.condense import condense_query
+from upsc_rag.generation.live_scores import record_answer_scores
 from upsc_rag.generation.router import OUT_OF_SCOPE_REPLY, is_off_topic, smalltalk_reply
 from upsc_rag.generation.sources import build_agentic_sources, build_source_dicts
+from upsc_rag.llm.clients import get_openai_client
+from upsc_rag.observability import NOOP_CONTEXT, trace_manager
 from upsc_rag.retrieval.hybrid import HybridRetriever
+from upsc_rag.retrieval.rewrite import rewrite_query
+from upsc_rag.retrieval.sufficiency import sources_answer_question
+from upsc_rag.retrieval.web import web_search_multi
 
 # Default book served by the API; override with UPSC_RAG_BOOK env var.
 BOOK_ID = os.environ.get("UPSC_RAG_BOOK", "laxmikanth_6")
@@ -101,15 +108,16 @@ class AskRequest(BaseModel):
     )
 
 
-def _history_and_search_query(req: "AskRequest", cfg: dict[str, Any]) -> tuple[
-    list[dict[str, Any]] | None, str
-]:
+def _history_and_search_query(
+    req: "AskRequest", cfg: dict[str, Any], parent: Any = None
+) -> tuple[list[dict[str, Any]] | None, str]:
     """Resolve conversation history + the (possibly condensed) query used for retrieval.
 
     Returns ``(history_dicts, search_query)``. When conversation is enabled and history
     is present, the follow-up is condensed into a standalone search query; otherwise the
-    raw query is used and history is None. The raw ``req.query`` is always what the answer
-    LLM sees (with history) — condensing only affects retrieval.
+    raw query is used and history is None. The condensed question feeds BOTH retrieval and
+    generation — it has references and abbreviations resolved, which the answer LLM needs
+    too (see the /ask handler). ``parent`` nests the condense trace under the request root.
     """
     conv_cfg = cfg.get("conversation", {})
     if not (conv_cfg.get("enabled", True) and req.history):
@@ -120,6 +128,7 @@ def _history_and_search_query(req: "AskRequest", cfg: dict[str, Any]) -> tuple[
         history,
         model=conv_cfg.get("condense_model", "gpt-4.1-nano"),
         session_id=req.session_id,
+        parent=parent,
     )
     return history, search_query
 
@@ -151,6 +160,73 @@ class AskResponse(BaseModel):
 def _build_sources(results: list[dict[str, Any]]) -> list[Source]:
     """Turn retrieval results into Source objects, deduped by section+pages, renumbered."""
     return [Source(**s) for s in build_source_dicts(results)]
+
+
+def _run_web_search(
+    query: str, cfg: dict[str, Any], session_id: str | None, root: Any
+) -> list[dict[str, Any]]:
+    """Search the web for ``query``; ``[]`` on failure (caller then answers book-only).
+
+    Runs only when ``sources_answer_question`` says the retrieved sections don't answer the
+    question, and only after the relevance floor — so off-topic questions never reach the
+    web. Kept separate from the sufficiency check so /ask/stream can emit a "searching the
+    web" status between the two.
+
+    The user's wording is REWRITTEN before it is sent to the engine. A search engine takes
+    the string literally, so "who is the current CJI and UPSC chairmain" returns SEO filler
+    (opaque abbreviation, typo, two questions in one) — while "Chief Justice of India
+    current appointment" returns the answer outright. rewrite_query also splits a compound
+    question into one query per part, and web_search_multi round-robins the results so both
+    parts survive truncation.
+    """
+    ws_cfg = cfg.get("web_search", {}) or {}
+    rw_cfg = (cfg.get("retrieval", {}) or {}).get("rewrite", {}) or {}
+
+    queries = [query]
+    try:
+        variants = rewrite_query(
+            query,
+            get_openai_client(),
+            model=rw_cfg.get("model", "gpt-4.1-nano"),
+            num_variants=ws_cfg.get("num_queries", 3),
+            obs=root or NOOP_CONTEXT,
+        )
+        # rewrite_query returns [original, *rewrites]; the rewrites are the keyword-y ones
+        # the engine can actually use. Keep the original only if it produced nothing.
+        queries = [v for v in variants if v != query] or [query]
+    except Exception:
+        pass  # rewriting is an optimization — fall back to the raw query
+
+    return web_search_multi(
+        queries,
+        max_results=ws_cfg.get("max_results", 5),
+        region=ws_cfg.get("region", "in-en"),
+        session_id=session_id,
+        parent=root,
+    )
+
+
+def _status(stage: str, label: str) -> str:
+    """One NDJSON status event — narrates the pipeline stage the client is waiting on."""
+    return json.dumps({"type": "status", "stage": stage, "label": label}) + "\n"
+
+
+# Pipeline stages surfaced to the UI while it waits (see _status).
+_S_RETRIEVING = ("retrieving", "Searching the textbook…")
+_S_CHECKING = ("checking", "Checking whether the textbook covers this…")
+_S_WEB = ("web", "The textbook doesn't cover this — searching the web…")
+_S_GENERATING = ("generating", "Writing the answer…")
+
+
+def _score_sources(
+    results: list[dict[str, Any]], web: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Sources to score the answer against — score_answer only reads each dict's "text".
+
+    When the answer was written over web results too, they must be included or
+    groundedness is measured against book sections the answer never used.
+    """
+    return results + [{"text": w.get("snippet", "")} for w in web]
 
 
 @app.get("/health")
@@ -186,29 +262,70 @@ def ask(req: AskRequest) -> AskResponse:
     if canned is not None:
         return AskResponse(answer=canned, sources=[])
 
-    # Resolve follow-ups: condense history + query into a standalone retrieval query.
-    history, search_query = _history_and_search_query(req, _state["cfg"])
-    results = retriever.retrieve(
-        search_query, top_k=req.top_k, rerank_top_k=req.rerank_top_k, session_id=req.session_id
-    )
+    # One root trace per question: condense + retrieve + generate nest under it, so
+    # Langfuse rolls up total cost/latency with a per-step breakdown in a single view.
+    with trace_manager.trace(
+        "ask", input={"query": req.query}, session_id=req.session_id
+    ) as root:
+        # Resolve follow-ups: condense history + query into a standalone retrieval query.
+        history, search_query = _history_and_search_query(req, _state["cfg"], parent=root)
+        results = retriever.retrieve(
+            search_query, top_k=req.top_k, rerank_top_k=req.rerank_top_k,
+            session_id=req.session_id, parent=root,
+        )
 
-    # Gate 2: real question, but no relevant source in the book — skip generation.
-    floor = _state["cfg"].get("retrieval", {}).get("relevance_floor", 0.0)
-    if is_off_topic(results, floor):
-        return AskResponse(answer=OUT_OF_SCOPE_REPLY, sources=[])
+        # Gate 2: real question, but no relevant source in the book — skip generation.
+        floor = _state["cfg"].get("retrieval", {}).get("relevance_floor", 0.0)
+        if is_off_topic(results, floor):
+            root.end(output={"route": "out_of_scope"})
+            return AskResponse(answer=OUT_OF_SCOPE_REPLY, sources=[])
 
-    answer = generate_answer(
-        req.query, results, _state["cfg"], session_id=req.session_id, history=history
-    )
-    return AskResponse(answer=answer, sources=_build_sources(results))
+        # Gate 3: on-topic, but do the retrieved sections actually ANSWER it? If not (the
+        # framers' intent, post-2011 events, current office-holders), search the web and
+        # answer over textbook + web instead of replying "the sources do not specify".
+        web: list[dict[str, Any]] = []
+        if not sources_answer_question(
+            search_query, results, _state["cfg"], session_id=req.session_id, parent=root
+        ):
+            web = _run_web_search(search_query, _state["cfg"], req.session_id, root)
+
+        # Generate from the CONDENSED question, not the raw one: it has the follow-up's
+        # references and abbreviations resolved ("from where was the FD taken?" ->
+        # "...Fundamental Duties..."). Given the raw form, the answer LLM decodes the
+        # abbreviation from the conversation's topic and answers the wrong question even
+        # when retrieval fetched the right sources. On a first turn (no history) condense
+        # is a no-op, so this IS req.query.
+        if web:
+            answer = generate_agentic_answer(
+                search_query, results, web, _state["cfg"], session_id=req.session_id,
+                history=history, parent=root,
+            )
+            sources = [Source(**s) for s in build_agentic_sources(results, web)]
+        else:
+            answer = generate_answer(
+                search_query, results, _state["cfg"], session_id=req.session_id,
+                history=history, parent=root,
+            )
+            sources = _build_sources(results)
+
+        record_answer_scores(
+            root, search_query, answer, _score_sources(results, web), _state["cfg"]
+        )
+        # Filterable in Langfuse: how often does the book fail to answer on its own?
+        root.score("used_web", 1.0 if web else 0.0)
+        root.end(output={"answer_chars": len(answer), "used_web": bool(web), "num_web": len(web)})
+    return AskResponse(answer=answer, sources=sources)
 
 
 @app.post("/ask/stream")
 def ask_stream(req: AskRequest) -> StreamingResponse:
-    """Stream the answer as NDJSON events: one 'sources' event, then 'token' events, then 'done'.
+    """Stream the answer as NDJSON events: 'status' × N, then 'sources', 'token' × N, 'done'.
 
-    Retrieval runs first (so sources are sent immediately), then generation tokens
-    stream as they arrive — letting the client measure time-to-first-token.
+    'status' events narrate the stage the client is waiting on (searching the textbook,
+    checking whether it covers the question, falling back to the web, writing the answer),
+    so the direct path runs its pipeline inside the generator and flushes each stage as it
+    reaches it. Then generation tokens stream as they arrive — letting the client measure
+    time-to-first-token. Clients that ignore 'status' see the original event contract.
     """
     retriever: HybridRetriever | None = _state.get("retriever")
     if retriever is None:
@@ -267,57 +384,127 @@ def ask_stream(req: AskRequest) -> StreamingResponse:
 
         return StreamingResponse(agentic_event_stream(), media_type="application/x-ndjson")
 
-    # Graph mode: run the smalltalk → retrieve → gate prefix through the graph nodes,
-    # then stream tokens below exactly as the direct path does (same NDJSON contract).
+    # Graph mode precomputes retrieval out here (it keeps its own tracing and emits no
+    # status events). The DIRECT path instead runs its whole pipeline *inside* the
+    # generator below: the client must receive "Searching the textbook…" while that search
+    # is happening, and nothing can be sent from a response that hasn't started streaming.
+    graph_results: list[dict[str, Any]] | None = None
+    graph_history: list[dict[str, Any]] | None = None
+
     if USE_GRAPH:
         from upsc_rag.graph import prepare_stream
 
-        history = [t.model_dump() for t in req.history] if req.history else None
+        graph_history = [t.model_dump() for t in req.history] if req.history else None
         prep = prepare_stream(
             retriever, _state["cfg"], req.query, top_k=req.top_k,
-            rerank_top_k=req.rerank_top_k, session_id=req.session_id, history=history,
+            rerank_top_k=req.rerank_top_k, session_id=req.session_id, history=graph_history,
         )
         if prep["route"] != "answer":
             return StreamingResponse(
                 canned_stream(prep["answer"]), media_type="application/x-ndjson"
             )
-        results = prep["results"]
+        graph_results = prep["results"]
     else:
         # Gate 1: pure greeting / chit-chat — reply without retrieving or generating.
+        # Stays outside the generator: it does no work, so there is no wait to narrate.
         canned = smalltalk_reply(req.query)
         if canned is not None:
             return StreamingResponse(canned_stream(canned), media_type="application/x-ndjson")
 
-        # Resolve follow-ups: condense history + query into a standalone retrieval query.
-        history, search_query = _history_and_search_query(req, _state["cfg"])
-        results = retriever.retrieve(
-            search_query, top_k=req.top_k, rerank_top_k=req.rerank_top_k, session_id=req.session_id
-        )
-
-        # Gate 2: real question, but no relevant source in the book — skip generation.
-        floor = _state["cfg"].get("retrieval", {}).get("relevance_floor", 0.0)
-        if is_off_topic(results, floor):
-            return StreamingResponse(
-                canned_stream(OUT_OF_SCOPE_REPLY), media_type="application/x-ndjson"
-            )
-
-    sources = _build_sources(results)
-
     def event_stream() -> Iterator[str]:
-        yield json.dumps({"type": "sources", "sources": [s.model_dump() for s in sources]}) + "\n"
-        # generate_answer_stream traces its own LLM generation (see generation/answer.py).
-        # usage_sink is filled with token counts + estimated cost once the stream ends.
+        root: Any = None                        # request root trace (direct path only)
+        history: list[dict[str, Any]] | None = graph_history
+        results: list[dict[str, Any]] = graph_results or []
+        web: list[dict[str, Any]] = []          # non-empty once the web fallback fires
+        gen_query: str = req.query
         usage_sink: dict[str, Any] = {}
-        for delta in generate_answer_stream(
-            req.query, results, _state["cfg"], session_id=req.session_id,
-            usage_sink=usage_sink, history=history,
-        ):
-            yield json.dumps({"type": "token", "text": delta}) + "\n"
-        yield json.dumps({
-            "type": "done",
-            "cost_usd": usage_sink.get("cost_usd", 0.0),
-            "input_tokens": usage_sink.get("input_tokens", 0),
-            "output_tokens": usage_sink.get("output_tokens", 0),
-        }) + "\n"
+        parts: list[str] = []
+        trace_out: dict[str, Any] | None = None  # set on an early gated exit
+        try:
+            if graph_results is None:
+                # Direct path: run the pipeline here, narrating each stage as we go.
+                root = trace_manager.open_root(
+                    "ask", input={"query": req.query}, session_id=req.session_id
+                )
+                yield _status(*_S_RETRIEVING)
+                # Resolve follow-ups into a standalone query, then search the textbook.
+                history, gen_query = _history_and_search_query(req, _state["cfg"], parent=root)
+                results = retriever.retrieve(
+                    gen_query, top_k=req.top_k, rerank_top_k=req.rerank_top_k,
+                    session_id=req.session_id, parent=root,
+                )
+
+                # Gate 2: real question, but nothing relevant in the book — no generation.
+                floor = _state["cfg"].get("retrieval", {}).get("relevance_floor", 0.0)
+                if is_off_topic(results, floor):
+                    trace_out = {"route": "out_of_scope"}
+                    yield json.dumps({"type": "sources", "sources": []}) + "\n"
+                    yield json.dumps({"type": "token", "text": OUT_OF_SCOPE_REPLY}) + "\n"
+                    yield json.dumps(
+                        {"type": "done", "cost_usd": 0.0, "input_tokens": 0, "output_tokens": 0}
+                    ) + "\n"
+                    return
+
+                # Gate 3: on-topic, but do the sections actually ANSWER it? If not, say so
+                # in the UI and fall back to the web rather than "the sources do not specify".
+                yield _status(*_S_CHECKING)
+                if not sources_answer_question(
+                    gen_query, results, _state["cfg"],
+                    session_id=req.session_id, parent=root,
+                ):
+                    yield _status(*_S_WEB)
+                    web = _run_web_search(gen_query, _state["cfg"], req.session_id, root)
+
+            # Web sources are numbered after the book ones, matching build_agentic_prompt.
+            sources = (
+                [Source(**s) for s in build_agentic_sources(results, web)] if web
+                else _build_sources(results)
+            )
+            yield json.dumps(
+                {"type": "sources", "sources": [s.model_dump() for s in sources]}
+            ) + "\n"
+            yield _status(*_S_GENERATING)
+
+            # Web fallback fired -> synthesize over textbook + web (same citation numbering
+            # as the `sources` event); otherwise stream from the textbook exactly as before.
+            # In graph mode root is None, so the generator emits its own trace as before.
+            stream = (
+                generate_agentic_answer_stream(
+                    gen_query, results, web, _state["cfg"], session_id=req.session_id,
+                    usage_sink=usage_sink, history=history, parent=root,
+                )
+                if web
+                else generate_answer_stream(
+                    gen_query, results, _state["cfg"], session_id=req.session_id,
+                    usage_sink=usage_sink, history=history, parent=root,
+                )
+            )
+            for delta in stream:
+                parts.append(delta)
+                yield json.dumps({"type": "token", "text": delta}) + "\n"
+            yield json.dumps({
+                "type": "done",
+                "cost_usd": usage_sink.get("cost_usd", 0.0),
+                "input_tokens": usage_sink.get("input_tokens", 0),
+                "output_tokens": usage_sink.get("output_tokens", 0),
+            }) + "\n"
+            # Score the full answer once streaming completes (tokens already sent).
+            record_answer_scores(
+                root, gen_query, "".join(parts), _score_sources(results, web), _state["cfg"]
+            )
+            # Filterable in Langfuse: how often does the book fail to answer on its own?
+            if root is not None:
+                root.score("used_web", 1.0 if web else 0.0)
+        finally:
+            # Close + flush the request root once the stream ends (or the client
+            # disconnects). No-op in graph mode where root is None.
+            if root is not None:
+                root.end(output=trace_out or {
+                    "output_tokens": usage_sink.get("output_tokens", 0),
+                    "cost_usd": usage_sink.get("cost_usd", 0.0),
+                    "used_web": bool(web),
+                    "num_web": len(web),
+                })
+                trace_manager.flush()
 
     return StreamingResponse(event_stream(), media_type="application/x-ndjson")
