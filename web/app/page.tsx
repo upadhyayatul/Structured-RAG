@@ -175,7 +175,11 @@ export default function Home() {
             answer += evt.text;
             patchLast({ content: answer });
           } else if (evt.type === "done") {
+            // "done" marks the end of the answer; the connection stays open a few
+            // more seconds for backend scoring + trace flush, so don't wait for
+            // stream close to reveal the stamp/references.
             patchLast({
+              streaming: false,
               costUsd: typeof evt.cost_usd === "number" ? evt.cost_usd : undefined,
               totalTokens:
                 typeof evt.input_tokens === "number" && typeof evt.output_tokens === "number"
@@ -205,7 +209,7 @@ export default function Home() {
           href="https://github.com"
           target="_blank"
           rel="noreferrer"
-          className="text-sm text-neutral-500 hover:text-neutral-700 dark:hover:text-neutral-300"
+          className="text-sm text-muted underline decoration-rule underline-offset-4 hover:text-foreground"
         >
           Source Code
         </a>
@@ -214,8 +218,9 @@ export default function Home() {
       <div ref={scrollRef} className="flex-1 overflow-y-auto">
         <div className="mx-auto w-full max-w-3xl px-4 pb-6">
           <header className="py-8 text-center">
-            <h1 className="text-3xl font-bold">UPSC Polity Chat</h1>
-            <p className="mt-2 text-sm text-neutral-500">
+            <h1 className="font-display text-3xl uppercase tracking-widest">UPSC Polity Chat</h1>
+            <div className="mx-auto mt-3 w-56 border-t-4 border-double border-rule" aria-hidden />
+            <p className="mt-3 text-xs uppercase tracking-[0.18em] text-muted">
               Grounded RAG over M. Laxmikanth&apos;s <em>Indian Polity</em> (6th ed.) — answers with page citations.
             </p>
           </header>
@@ -235,22 +240,22 @@ export default function Home() {
         </div>
       </div>
 
-      <div className="border-t border-neutral-200 dark:border-neutral-800">
+      <div className="border-t border-rule">
         <div className="mx-auto w-full max-w-3xl px-4">
           {quote && <ReplyPreview quote={quote} onClear={() => setQuote(null)} />}
-          <form onSubmit={send} className="flex w-full items-center gap-2 py-4">
+          <form onSubmit={send} className="flex w-full items-center gap-3 py-4">
             <input
               ref={inputRef}
               value={input}
               onChange={(e) => setInput(e.target.value)}
-              placeholder={quote ? "Ask about the quoted text…" : "Send a message…"}
-              className="flex-1 rounded-lg border border-neutral-300 bg-transparent px-4 py-3 text-sm outline-none focus:border-neutral-500 dark:border-neutral-700"
+              placeholder={quote ? "Ask about the quoted text…" : "Type your query…"}
+              className="flex-1 rounded-none border-b-2 border-rule bg-transparent px-1 py-3 text-sm outline-none placeholder:text-muted/70 focus:border-foreground"
             />
             <button
               type="submit"
               disabled={loading || !input.trim()}
               aria-label="Send"
-              className="rounded-lg border border-neutral-300 p-3 text-neutral-600 hover:bg-neutral-100 disabled:opacity-40 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-900"
+              className="rounded-sm border border-foreground/40 bg-card p-3 text-foreground shadow-[2px_2px_0_var(--rule)] hover:bg-background active:translate-x-px active:translate-y-px active:shadow-none disabled:opacity-40"
             >
               <SendIcon />
             </button>
@@ -271,7 +276,7 @@ export default function Home() {
             left: selection.x,
             transform: "translateX(-50%)",
           }}
-          className="z-50 flex items-center gap-1.5 rounded-full border border-neutral-300 bg-white px-3 py-1.5 text-xs font-medium text-neutral-700 shadow-lg hover:bg-neutral-100 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-200 dark:hover:bg-neutral-800"
+          className="z-50 flex items-center gap-1.5 rounded-sm border border-foreground/50 bg-card px-3 py-1.5 font-display text-xs uppercase tracking-wider text-foreground shadow-[2px_2px_0_var(--rule)] hover:bg-background"
         >
           <QuoteIcon />
           Ask about this
@@ -297,7 +302,7 @@ const SAMPLE_QUESTIONS = [
 function SampleQuestions({ onPick }: { onPick: (q: string) => void }) {
   return (
     <div className="mb-2">
-      <p className="mb-3 text-center text-xs uppercase tracking-wide text-neutral-400">
+      <p className="mb-3 text-center font-display text-xs uppercase tracking-[0.2em] text-muted">
         Try asking
       </p>
       <div className="flex flex-wrap justify-center gap-2">
@@ -306,7 +311,7 @@ function SampleQuestions({ onPick }: { onPick: (q: string) => void }) {
             key={q}
             type="button"
             onClick={() => onPick(q)}
-            className="rounded-full border border-neutral-300 px-4 py-2 text-left text-sm text-neutral-700 transition-colors hover:border-neutral-500 hover:bg-neutral-100 dark:border-neutral-700 dark:text-neutral-300 dark:hover:border-neutral-500 dark:hover:bg-neutral-900"
+            className="rounded-sm border border-rule bg-card px-4 py-2 text-left text-sm text-foreground/90 transition-colors hover:border-foreground/60"
           >
             {q}
           </button>
@@ -319,14 +324,14 @@ function SampleQuestions({ onPick }: { onPick: (q: string) => void }) {
 // WhatsApp-style reply preview: the quoted excerpt pinned above the input, with a clear button.
 function ReplyPreview({ quote, onClear }: { quote: string; onClear: () => void }) {
   return (
-    <div className="mt-3 flex items-start gap-2 rounded-lg border-l-2 border-neutral-400 bg-neutral-100 px-3 py-2 dark:border-neutral-500 dark:bg-neutral-900">
+    <div className="mt-3 flex items-start gap-2 rounded-sm border-l-2 border-stamp-red bg-card px-3 py-2">
       <QuoteIcon />
-      <p className="line-clamp-2 flex-1 text-xs text-neutral-600 dark:text-neutral-400">{quote}</p>
+      <p className="line-clamp-2 flex-1 text-xs italic text-muted">{quote}</p>
       <button
         type="button"
         onClick={onClear}
         aria-label="Remove quote"
-        className="text-neutral-400 hover:text-neutral-700 dark:hover:text-neutral-200"
+        className="text-muted hover:text-foreground"
       >
         <CloseIcon />
       </button>
@@ -337,9 +342,9 @@ function ReplyPreview({ quote, onClear }: { quote: string; onClear: () => void }
 function UserBubble({ text, quote }: { text: string; quote?: string }) {
   return (
     <div className="flex justify-end">
-      <div className="max-w-[80%] rounded-2xl bg-neutral-900 px-4 py-2.5 text-sm text-white dark:bg-white dark:text-black">
+      <div className="max-w-[80%] rounded-sm border border-foreground/30 bg-card px-4 py-2.5 text-sm shadow-[2px_2px_0_var(--rule)]">
         {quote && (
-          <div className="mb-1.5 line-clamp-3 border-l-2 border-white/40 pl-2 text-xs italic opacity-70 dark:border-black/40">
+          <div className="mb-1.5 line-clamp-3 border-l-2 border-stamp-red/60 pl-2 text-xs italic text-muted">
             {quote}
           </div>
         )}
@@ -355,7 +360,8 @@ function AssistantMessage({ message }: { message: ChatMessage }) {
 
   if (message.error) {
     return (
-      <div className="whitespace-pre-wrap rounded-lg border border-red-400/40 bg-red-500/10 px-4 py-3 text-sm text-red-500 dark:text-red-400">
+      <div className="whitespace-pre-wrap rounded-sm border border-stamp-red/60 bg-card px-4 py-3 text-sm text-stamp-red">
+        <span className="font-display uppercase tracking-wider">Error: </span>
         {message.content}
       </div>
     );
@@ -364,7 +370,7 @@ function AssistantMessage({ message }: { message: ChatMessage }) {
   return (
     <div className="space-y-3">
       {(message.ttftMs != null || message.costUsd != null) && (
-        <div className="flex flex-wrap gap-x-2 text-xs text-neutral-400">
+        <div className="flex flex-wrap gap-x-2 text-[11px] uppercase tracking-[0.12em] text-muted">
           {message.ttftMs != null && (
             <span>First token in {(message.ttftMs / 1000).toFixed(1)}s</span>
           )}
@@ -386,8 +392,8 @@ function AssistantMessage({ message }: { message: ChatMessage }) {
       )}
 
       {waiting ? (
-        <div className="flex items-center gap-2 text-sm text-neutral-500">
-          <Spinner /> {message.status ?? "Thinking…"}
+        <div className="type-cursor text-sm uppercase tracking-wider text-muted">
+          {message.status ?? "Thinking"}
         </div>
       ) : (
         <div data-answer className="markdown text-sm leading-relaxed text-foreground">
@@ -400,29 +406,29 @@ function AssistantMessage({ message }: { message: ChatMessage }) {
       {!message.streaming && provenance && <ProvenanceBadge provenance={provenance} />}
 
       {message.sources && message.sources.length > 0 && (
-        <div className="space-y-1 border-l-2 border-neutral-200 pl-3 text-xs text-neutral-500 dark:border-neutral-800">
-          <div className="font-semibold uppercase tracking-wide">Sources</div>
+        <div className="space-y-1 border-t border-dashed border-rule pt-2 text-xs text-muted">
+          <div className="font-display uppercase tracking-[0.2em]">References</div>
           <ol className="space-y-0.5">
             {message.sources.map((s) =>
               s.type === "web" ? (
                 <li key={s.n}>
-                  <span className="text-neutral-400">[{s.n}]</span>{" "}
+                  <span className="text-muted/70">[{s.n}]</span>{" "}
                   <a
                     href={s.url ?? undefined}
                     target="_blank"
                     rel="noreferrer"
-                    className="text-blue-600 hover:underline dark:text-blue-400"
+                    className="text-ink-blue hover:underline"
                   >
                     {s.title || s.url}
                   </a>
-                  <span className="text-neutral-400"> · web</span>
+                  <span className="text-muted/70"> · web</span>
                 </li>
               ) : (
                 <li key={s.n}>
-                  <span className="text-neutral-400">[{s.n}]</span>{" "}
+                  <span className="text-muted/70">[{s.n}]</span>{" "}
                   {(s.section_path ?? []).join(" › ") || s.chapter_title}
                   {s.page_start != null && (
-                    <span className="text-neutral-400">
+                    <span className="text-muted/70">
                       {" "}· p.{s.page_start}
                       {s.page_end != null && s.page_end !== s.page_start ? `–${s.page_end}` : ""}
                     </span>
@@ -465,29 +471,18 @@ function answerProvenance(message: ChatMessage): Provenance | null {
   return "book";
 }
 
+// Stamp-pad ink colors: red for the book, fountain-pen blue for the web,
+// office violet for both.
 const PROVENANCE_META: Record<Provenance, { label: string; className: string }> = {
-  book: {
-    label: "From the textbook",
-    className:
-      "bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300",
-  },
-  web: {
-    label: "From the web",
-    className: "bg-blue-100 text-blue-700 dark:bg-blue-500/15 dark:text-blue-300",
-  },
-  mixed: {
-    label: "Textbook + web",
-    className:
-      "bg-purple-100 text-purple-700 dark:bg-purple-500/15 dark:text-purple-300",
-  },
+  book: { label: "From the textbook", className: "text-stamp-red" },
+  web: { label: "From the web", className: "text-ink-blue" },
+  mixed: { label: "Textbook + web", className: "text-stamp-violet" },
 };
 
 function ProvenanceBadge({ provenance }: { provenance: Provenance }) {
   const { label, className } = PROVENANCE_META[provenance];
   return (
-    <span
-      className={`inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium ${className}`}
-    >
+    <span className={`stamp inline-flex items-center text-[11px] ${className}`}>
       {label}
     </span>
   );
@@ -500,13 +495,13 @@ const MD = {
   ul: (props: React.HTMLAttributes<HTMLUListElement>) => <ul className="mb-3 list-disc space-y-1 pl-5" {...props} />,
   li: (props: React.LiHTMLAttributes<HTMLLIElement>) => <li className="pl-1" {...props} />,
   strong: (props: React.HTMLAttributes<HTMLElement>) => <strong className="font-semibold" {...props} />,
-  h1: (props: React.HTMLAttributes<HTMLHeadingElement>) => <h1 className="mb-2 mt-4 text-lg font-bold" {...props} />,
-  h2: (props: React.HTMLAttributes<HTMLHeadingElement>) => <h2 className="mb-2 mt-4 text-base font-bold" {...props} />,
-  h3: (props: React.HTMLAttributes<HTMLHeadingElement>) => <h3 className="mb-1 mt-3 font-semibold" {...props} />,
+  h1: (props: React.HTMLAttributes<HTMLHeadingElement>) => <h1 className="mb-2 mt-4 font-display text-lg" {...props} />,
+  h2: (props: React.HTMLAttributes<HTMLHeadingElement>) => <h2 className="mb-2 mt-4 font-display text-base" {...props} />,
+  h3: (props: React.HTMLAttributes<HTMLHeadingElement>) => <h3 className="mb-1 mt-3 font-display" {...props} />,
   code: (props: React.HTMLAttributes<HTMLElement>) => (
-    <code className="rounded bg-neutral-200 px-1 py-0.5 font-mono text-[0.85em] dark:bg-neutral-800" {...props} />
+    <code className="rounded-none border border-rule bg-card px-1 py-0.5 font-mono text-[0.85em]" {...props} />
   ),
-  a: (props: React.AnchorHTMLAttributes<HTMLAnchorElement>) => <a className="underline" {...props} />,
+  a: (props: React.AnchorHTMLAttributes<HTMLAnchorElement>) => <a className="text-ink-blue underline" {...props} />,
 };
 
 function ThemeToggle({ dark, onToggle }: { dark: boolean; onToggle: () => void }) {
@@ -518,10 +513,10 @@ function ThemeToggle({ dark, onToggle }: { dark: boolean; onToggle: () => void }
         role="switch"
         aria-checked={dark}
         aria-label="Toggle dark mode"
-        className="inline-flex h-6 w-11 items-center rounded-full bg-neutral-300 px-0.5 transition-colors dark:bg-neutral-600"
+        className="inline-flex h-6 w-11 items-center rounded-full border border-foreground/30 bg-rule px-0.5 transition-colors"
       >
         <span
-          className={`h-5 w-5 rounded-full bg-white shadow transition-transform ${
+          className={`h-4.5 w-4.5 rounded-full border border-foreground/40 bg-card shadow transition-transform ${
             dark ? "translate-x-5" : "translate-x-0"
           }`}
         />
@@ -560,7 +555,7 @@ function CloseIcon() {
 
 function SunIcon() {
   return (
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-neutral-500">
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-muted">
       <circle cx="12" cy="12" r="4" />
       <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41" />
     </svg>
@@ -569,17 +564,8 @@ function SunIcon() {
 
 function MoonIcon() {
   return (
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-neutral-500">
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-muted">
       <path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z" />
-    </svg>
-  );
-}
-
-function Spinner() {
-  return (
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" className="animate-spin">
-      <circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth="2" strokeOpacity="0.25" />
-      <path d="M21 12a9 9 0 0 0-9-9" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
     </svg>
   );
 }

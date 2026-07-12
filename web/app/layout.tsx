@@ -1,14 +1,18 @@
 import type { Metadata } from "next";
-import { Geist, Geist_Mono } from "next/font/google";
+import { Courier_Prime, Special_Elite } from "next/font/google";
 import "./globals.css";
 
-const geistSans = Geist({
-  variable: "--font-geist-sans",
+// Typewriter pairing for the government-dossier theme:
+// Courier Prime for body copy, Special Elite for headings/labels/stamps.
+const courierPrime = Courier_Prime({
+  variable: "--font-courier-prime",
+  weight: ["400", "700"],
   subsets: ["latin"],
 });
 
-const geistMono = Geist_Mono({
-  variable: "--font-geist-mono",
+const specialElite = Special_Elite({
+  variable: "--font-special-elite",
+  weight: "400",
   subsets: ["latin"],
 });
 
@@ -26,7 +30,7 @@ export default function RootLayout({
     <html
       lang="en"
       suppressHydrationWarning
-      className={`${geistSans.variable} ${geistMono.variable} dark h-full antialiased`}
+      className={`${courierPrime.variable} ${specialElite.variable} dark h-full antialiased`}
     >
       <body className="h-full">{children}</body>
     </html>
