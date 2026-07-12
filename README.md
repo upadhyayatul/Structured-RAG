@@ -34,7 +34,7 @@ flowchart LR
 | 9. UI | `web/` | Next.js streaming chat with citations | ✅ Done |
 | 10. Evaluate | `eval/` | Retrieval, cheap generation-quality, and LLM-judge harnesses on a labeled gold set | 🟡 In progress |
 
-**Current status:** Full pipeline works end-to-end — ingest → embed → hybrid retrieve → LLM answer, exposed via FastAPI and a Next.js chat UI with token streaming. Three evaluation harnesses are in place (see [Evaluation](#evaluation)): retrieval quality, a cheap generation-quality harness (groundedness + citation), and a nuanced **LLM-judge rubric** (`gpt-5-mini`) that cross-checks the cheap signals. The judge drove a tuning loop (prompt-faithfulness pass + `gpt-4.1` generator) that lifted overall answer quality from **3.43 → 4.01 / 5**; the open levers are citation precision and the production-generator cost decision. See `progress.json` for details.
+**Current status:** Full pipeline works end-to-end — ingest → embed → hybrid retrieve → LLM answer, exposed via FastAPI and a Next.js chat UI with token streaming (restyled as a retro **government-dossier theme**: typewriter fonts, aged-paper palette, rubber-stamp provenance badges). The direct path now carries a **sufficiency-gated web fallback** (post-2011 topics the 2011 book can't cover get DuckDuckGo results synthesized alongside the textbook), follow-up questions are **condensed with conversation history**, every chat call can route through a **LiteLLM AI gateway**, and each request emits a unified **Langfuse** trace with live quality scores. Three evaluation harnesses are in place (see [Evaluation](#evaluation)): retrieval quality (**70-question gold set** — hit@k 98.6 %, MRR 0.802), a cheap generation-quality harness (groundedness + citation), and a nuanced **LLM-judge rubric** (`gpt-5-mini`) that cross-checks the cheap signals. The judge drove a tuning loop (prompt-faithfulness pass + `gpt-4.1` generator) that lifted overall answer quality from **3.43 → 4.01 / 5**; the open levers are citation precision and the production-generator cost decision. See `progress.json` for details.
 
 ---
 
@@ -98,6 +98,37 @@ the `orchestration` stage in `progress.json`.
 $env:UPSC_RAG_PIPELINE = "graph"
 python -m uvicorn upsc_rag.api.app:app --reload --port 8000
 ```
+
+### Web fallback on the direct path (sufficiency-gated)
+
+The off-topic relevance floor only measures whether retrieval found *related* sections — not
+whether they actually answer the question. So after the floor, a cheap **sufficiency check**
+(`retrieval/sufficiency.py`) asks whether the retrieved sections contain what was asked; on
+"no", the API runs `retrieval/web.py::web_search` (DuckDuckGo) and answers over **textbook +
+web** via the same agentic synthesis prompt. This is what stops *"the sources do not specify"*
+on questions the 2011 book can't cover — framers' intent, post-2011 amendments, current
+office-holders. It runs *after* the off-topic gate, so junk never reaches the web. Toggle via
+`retrieval.web_fallback.enabled` in `config/default.yaml` (off = textbook-only, no classifier
+call). The UI stamps each answer with its provenance: **from the textbook / from the web /
+textbook + web**.
+
+### Conversation history (follow-up questions)
+
+The frontend sends the last few completed exchanges with each request (`history` +
+`session_id`); the backend **condenses** a follow-up ("what about *his* removal?") into a
+standalone question using that history, and the condensed query feeds both retrieval and
+generation. One browser session = one Langfuse session for trace grouping.
+
+### Observability (Langfuse)
+
+Every `/ask` request on the direct path emits **one unified `ask` root trace** with per-step
+spans — rewrite, retrieve, sufficiency, web_search, generate — plus **live scores** computed
+right after the answer finishes (grounded_fraction, citation validity, `used_web`, retrieval
+top-score). Scoring runs *after* the `done` NDJSON event is sent, so it never delays the
+answer: the UI reveals the finished answer at `done` while the backend spends a few more
+seconds scoring and flushing the trace. Langfuse ships in `docker-compose.yml`; keys live in
+`.env` (note: they reset if the container volume is wiped — a silent 401 in the logs is the
+symptom).
 
 ### AI gateway (LiteLLM)
 
@@ -210,7 +241,7 @@ Structured-RAG/
 │   └── pipeline/             # run_ingest, run_embed orchestration
 │
 ├── web/                      # Next.js 16 frontend (React 19, TS, Tailwind v4)
-│   ├── app/page.tsx          # Streaming chat UI
+│   ├── app/page.tsx          # Streaming chat UI (retro government-dossier theme)
 │   ├── app/api/ask/route.ts  # BFF proxy → FastAPI stream
 │   ├── app/types.ts          # Shared AskResponse/Source types
 │   └── .env.local            # BACKEND_URL (default http://localhost:8000)
@@ -271,10 +302,10 @@ One JSON object per line:
 |----------|--------|---------|
 | `/health` | GET | Liveness + which book is loaded |
 | `/ask` | POST | `{ answer, sources[] }` (complete JSON) |
-| `/ask/stream` | POST | NDJSON event stream: one `sources` event, then `token` events, then `done` |
+| `/ask/stream` | POST | NDJSON event stream: `status` × N (pipeline stage labels), one `sources` event, `token` × N, then `done` (cost + token counts) |
 
-Request body: `{ "query": "...", "top_k"?: int, "rerank_top_k"?: int }`.
-The retriever is built once at startup (FastAPI lifespan) and reused per request. Sources are deduplicated by section + page range and renumbered.
+Request body: `{ "query": "...", "history"?: [{role, content}], "session_id"?: str, "top_k"?: int, "rerank_top_k"?: int }`.
+The retriever is built once at startup (FastAPI lifespan) and reused per request. Sources are deduplicated by section + page range and renumbered. The `done` event is sent **before** the post-answer Langfuse scoring/flush, so clients should treat `done` — not stream close — as end-of-answer (the bundled UI does).
 
 Interactive docs: **http://localhost:8000/docs**.
 
@@ -333,26 +364,33 @@ python scripts/evaluate.py --rerank 8 --no-rerank    # A/B a single layer
 
 ### The gold set
 
-30 questions, deliberately split to stress different failure modes:
+**70 questions** (expanded from 30 on 2026-07-10), deliberately split to stress different
+failure modes:
 
 - **10 clean** — textbook-phrased (e.g. *"How is a judge of the Supreme Court appointed?"*).
 - **20 messy** — colloquial and abbreviation-heavy, like real aspirants ask
   (e.g. *"ok so who actually picks SC judges, the collegium or the govt?"*, *"if an MLA jumps
   ship to another party can he lose his seat?"*). These exercise the query-rewrite layer and
   expose vocabulary gaps the clean set hides.
+- **40 breadth** — added across previously under-represented chapters (Vice-President,
+  President's veto/ordinance/pardon, Parliament procedure, Finance Commission, Preamble,
+  individual Fundamental Rights, citizenship, local government, tribunals, Lokpal, NHRC, …),
+  keeping the same clean/messy mix. Every question is grounded to a real parent section, and
+  Article labels are attached only where the chapter's Articles-at-a-Glance catalog backs them.
 
 ### Current results
 
-30 questions, `rerank_top_k=8`, all retrieval layers on (incl. cross-encoder rerank):
+70 questions, `rerank_top_k=8`, all retrieval layers on (incl. cross-encoder rerank):
 
 | Metric | Result |
 |--------|--------|
-| hit@k | **96.7 %** (29/30) |
-| MRR | **0.744** |
-| article_recall | **95.5 %** (21/22) |
-| avg_articles_on_hit | **4.2** |
+| hit@k | **98.6 %** (69/70) |
+| MRR | **0.802** |
+| article_recall | **97.4 %** (38/39) |
+| avg_articles_on_hit | **3.6** |
 
-The one remaining miss is a known catalog data gap (Article 361 immunity). This harness is
+Every metric *improved* over the 30-question set despite 40 harder/broader questions. The one
+remaining miss is a known catalog data gap (Article 361 immunity). This harness is
 **retrieval-only**; a complementary **generation-quality** harness scores the answers
 themselves — see [Generation-quality eval](#generation-quality-eval-3-cheap-signals--no-llm-judge) below.
 
@@ -571,6 +609,13 @@ per-answer cost of `gpt-4o-mini`, or `gpt-4.1-mini` at ~2×).
 - [x] LangGraph orchestration backend (parallel path behind `UPSC_RAG_PIPELINE=graph`) + LangChain LLM portability seam
 - [x] LLM-judge rubric (faithfulness / completeness / exam-appropriateness / citation) cross-checked against the cheap signals (`gpt-5-mini`)
 - [x] Judge-driven tuning loop — prompt-faithfulness refinements + `gpt-4.1` generator lifted judge overall 3.43 → 4.01 (faithfulness 3.37 → 4.07)
+- [x] Conversation history — follow-ups condensed into standalone questions (`history` + `session_id` in the API)
+- [x] Agentic ReAct path with polity-gated DuckDuckGo web search (`UPSC_RAG_PIPELINE=agentic`)
+- [x] Gold set expanded 30 → 70 questions — hit@k 98.6 %, MRR 0.802, article_recall 97.4 %
+- [x] LiteLLM AI gateway for all chat calls (`UPSC_RAG_LLM_GATEWAY=litellm`, off by default; embeddings stay direct)
+- [x] Sufficiency-gated web fallback on the direct path (textbook + web synthesis for post-2011 topics) + provenance stamps in the UI
+- [x] Langfuse observability — unified `ask` root trace with per-step spans + live scores (post-`done`, non-blocking)
+- [x] Retro government-dossier UI theme (typewriter type, aged-paper palette, rubber-stamp provenance badges)
 - [ ] Citation precision — cite only the source that supports each claim (judge citation_quality 3.53, the remaining laggard)
 - [ ] Adopt `gpt-4.1` (or `gpt-4.1-mini`) as the production generator if the completeness/exam gains justify the cost
 - [ ] Multi-book support in the UI (book selector)
