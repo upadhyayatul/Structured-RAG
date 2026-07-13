@@ -11,15 +11,11 @@ from upsc_rag.observability import trace_manager
 
 # Approx USD per 1M tokens, by model (OpenAI list prices — update if they change).
 # Used to show a rough per-answer cost in the UI; embeddings/rewrite are tiny next
-# to generation, so the displayed figure is the answer-generation cost.
+# to generation, so the displayed figure is the answer-generation cost. Only models
+# actually passed to estimate_cost need a row — add one when generation.model changes.
 _PRICING: dict[str, dict[str, float]] = {
     "gpt-4o-mini": {"input": 0.15, "output": 0.60},
-    "gpt-4o": {"input": 2.50, "output": 10.00},
-    "gpt-4.1": {"input": 2.00, "output": 8.00},
-    "gpt-4.1-mini": {"input": 0.40, "output": 1.60},
     "gpt-4.1-nano": {"input": 0.10, "output": 0.40},
-    "text-embedding-3-large": {"input": 0.13, "output": 0.0},
-    "text-embedding-3-small": {"input": 0.02, "output": 0.0},
 }
 
 
@@ -185,6 +181,79 @@ def build_agentic_prompt(
     )
 
 
+def _run_llm(
+    trace_name: str,
+    trace_input: dict[str, Any],
+    system: str,
+    user_prompt: str,
+    cfg: dict[str, Any],
+    *,
+    stream: bool,
+    client: OpenAI | None,
+    session_id: str | None,
+    usage_sink: dict[str, Any] | None,
+    history: list[dict[str, Any]] | None,
+    parent: Any,
+) -> Iterator[str]:
+    """Shared LLM call behind all four generate_* entry points.
+
+    Always a generator: yields token deltas when ``stream``, else the whole answer
+    once (so non-stream callers ``"".join(...)`` it). History windowing, tracing,
+    and usage/cost capture live here once.
+    """
+    gen_cfg = cfg.get("generation", {})
+    client = client or get_openai_client()
+    model = gen_cfg.get("model", "gpt-4o-mini")
+    params = {
+        "temperature": gen_cfg.get("temperature", 0.2),
+        "max_tokens": gen_cfg.get("max_tokens", 1024),
+    }
+    hist = _history_messages(history, cfg.get("conversation", {}).get("history_turns", 3))
+    messages = [
+        {"role": "system", "content": system},
+        *hist,
+        {"role": "user", "content": user_prompt},
+    ]
+
+    with trace_manager.start(
+        trace_name,
+        parent=parent,
+        input={**trace_input, "num_history": len(hist)},
+        session_id=session_id,
+    ) as trace:
+        gen = trace.generation("llm", model=model, input=messages, model_parameters=params)
+        with gen:
+            if stream:
+                response = client.chat.completions.create(
+                    model=model,
+                    stream=True,
+                    # Ask OpenAI for a final usage chunk so we can report token counts.
+                    stream_options={"include_usage": True},
+                    messages=messages,
+                    **params,
+                )
+                parts: list[str] = []
+                usage: Any = None
+                for chunk in response:
+                    if chunk.usage is not None:
+                        usage = chunk.usage
+                    delta = chunk.choices[0].delta.content if chunk.choices else None
+                    if delta:
+                        parts.append(delta)
+                        yield delta
+                text = "".join(parts)
+            else:
+                response = client.chat.completions.create(
+                    model=model, messages=messages, **params
+                )
+                text = response.choices[0].message.content or ""
+                usage = response.usage
+                yield text
+            gen.end(output=text, usage=_usage_dict(usage))
+            _fill_usage_sink(usage_sink, model, usage)
+        trace.end(output={"answer_chars": len(text)})
+
+
 def generate_agentic_answer(
     query: str,
     contexts: list[dict[str, Any]],
@@ -197,43 +266,17 @@ def generate_agentic_answer(
     parent: Any = None,
 ) -> str:
     """Synthesize a grounded, cited answer over combined textbook + web sources."""
-    gen_cfg = cfg.get("generation", {})
-    client = client or get_openai_client()
-    model = gen_cfg.get("model", "gpt-4o-mini")
-    hist = _history_messages(history, cfg.get("conversation", {}).get("history_turns", 3))
-    messages = [
-        {"role": "system", "content": _agentic_system_prompt()},
-        *hist,
-        {"role": "user", "content": build_agentic_prompt(query, contexts, web)},
-    ]
-
-    with trace_manager.start(
-        "agentic_answer",
-        parent=parent,
-        input={"query": query, "num_book": len(contexts), "num_web": len(web)},
-        session_id=session_id,
-    ) as trace:
-        gen = trace.generation(
-            "llm",
-            model=model,
-            input=messages,
-            model_parameters={
-                "temperature": gen_cfg.get("temperature", 0.2),
-                "max_tokens": gen_cfg.get("max_tokens", 1024),
-            },
+    return "".join(
+        _run_llm(
+            "agentic_answer",
+            {"query": query, "num_book": len(contexts), "num_web": len(web)},
+            _agentic_system_prompt(),
+            build_agentic_prompt(query, contexts, web),
+            cfg,
+            stream=False, client=client, session_id=session_id,
+            usage_sink=usage_sink, history=history, parent=parent,
         )
-        with gen:
-            response = client.chat.completions.create(
-                model=model,
-                temperature=gen_cfg.get("temperature", 0.2),
-                max_tokens=gen_cfg.get("max_tokens", 1024),
-                messages=messages,
-            )
-            text = response.choices[0].message.content or ""
-            gen.end(output=text, usage=_usage_dict(response.usage))
-            _fill_usage_sink(usage_sink, model, response.usage)
-        trace.end(output={"answer_chars": len(text)})
-        return text
+    )
 
 
 def generate_agentic_answer_stream(
@@ -248,53 +291,15 @@ def generate_agentic_answer_stream(
     parent: Any = None,
 ) -> Iterator[str]:
     """Stream the synthesized answer over combined textbook + web sources."""
-    gen_cfg = cfg.get("generation", {})
-    client = client or get_openai_client()
-    model = gen_cfg.get("model", "gpt-4o-mini")
-    hist = _history_messages(history, cfg.get("conversation", {}).get("history_turns", 3))
-    messages = [
-        {"role": "system", "content": _agentic_system_prompt()},
-        *hist,
-        {"role": "user", "content": build_agentic_prompt(query, contexts, web)},
-    ]
-
-    with trace_manager.start(
+    return _run_llm(
         "agentic_answer",
-        parent=parent,
-        input={"query": query, "num_book": len(contexts), "num_web": len(web)},
-        session_id=session_id,
-    ) as trace:
-        gen = trace.generation(
-            "llm",
-            model=model,
-            input=messages,
-            model_parameters={
-                "temperature": gen_cfg.get("temperature", 0.2),
-                "max_tokens": gen_cfg.get("max_tokens", 1024),
-            },
-        )
-        with gen:
-            stream = client.chat.completions.create(
-                model=model,
-                temperature=gen_cfg.get("temperature", 0.2),
-                max_tokens=gen_cfg.get("max_tokens", 1024),
-                stream=True,
-                stream_options={"include_usage": True},
-                messages=messages,
-            )
-            parts: list[str] = []
-            usage: Any = None
-            for chunk in stream:
-                if chunk.usage is not None:
-                    usage = chunk.usage
-                delta = chunk.choices[0].delta.content if chunk.choices else None
-                if delta:
-                    parts.append(delta)
-                    yield delta
-            text = "".join(parts)
-            gen.end(output=text, usage=_usage_dict(usage))
-            _fill_usage_sink(usage_sink, model, usage)
-        trace.end(output={"answer_chars": len(text)})
+        {"query": query, "num_book": len(contexts), "num_web": len(web)},
+        _agentic_system_prompt(),
+        build_agentic_prompt(query, contexts, web),
+        cfg,
+        stream=True, client=client, session_id=session_id,
+        usage_sink=usage_sink, history=history, parent=parent,
+    )
 
 
 def _history_messages(
@@ -363,44 +368,17 @@ def generate_answer(
     windowed via cfg["conversation"] and inserted before the current question so
     the model can resolve follow-up references.
     """
-    gen_cfg = cfg.get("generation", {})
-    client = client or get_openai_client()
-    model = gen_cfg.get("model", "gpt-4o-mini")
-    prompt = build_answer_prompt(query, contexts)
-    hist = _history_messages(history, cfg.get("conversation", {}).get("history_turns", 3))
-    messages = [
-        {"role": "system", "content": _SYSTEM_PROMPT},
-        *hist,
-        {"role": "user", "content": prompt},
-    ]
-
-    with trace_manager.start(
-        "answer",
-        parent=parent,
-        input={"query": query, "num_sources": len(contexts), "num_history": len(hist)},
-        session_id=session_id,
-    ) as trace:
-        gen = trace.generation(
-            "llm",
-            model=model,
-            input=messages,
-            model_parameters={
-                "temperature": gen_cfg.get("temperature", 0.2),
-                "max_tokens": gen_cfg.get("max_tokens", 1024),
-            },
+    return "".join(
+        _run_llm(
+            "answer",
+            {"query": query, "num_sources": len(contexts)},
+            _SYSTEM_PROMPT,
+            build_answer_prompt(query, contexts),
+            cfg,
+            stream=False, client=client, session_id=session_id,
+            usage_sink=usage_sink, history=history, parent=parent,
         )
-        with gen:
-            response = client.chat.completions.create(
-                model=model,
-                temperature=gen_cfg.get("temperature", 0.2),
-                max_tokens=gen_cfg.get("max_tokens", 1024),
-                messages=messages,
-            )
-            text = response.choices[0].message.content or ""
-            gen.end(output=text, usage=_usage_dict(response.usage))
-            _fill_usage_sink(usage_sink, model, response.usage)
-        trace.end(output={"answer_chars": len(text)})
-        return text
+    )
 
 
 def generate_answer_stream(
@@ -418,54 +396,15 @@ def generate_answer_stream(
     `history` (prior {role, content} turns) is windowed via cfg["conversation"] and
     inserted before the current question so the model can resolve follow-up references.
     """
-    gen_cfg = cfg.get("generation", {})
-    client = client or get_openai_client()
-    model = gen_cfg.get("model", "gpt-4o-mini")
-    hist = _history_messages(history, cfg.get("conversation", {}).get("history_turns", 3))
-    messages = [
-        {"role": "system", "content": _SYSTEM_PROMPT},
-        *hist,
-        {"role": "user", "content": build_answer_prompt(query, contexts)},
-    ]
-
-    with trace_manager.start(
+    return _run_llm(
         "answer",
-        parent=parent,
-        input={"query": query, "num_sources": len(contexts), "num_history": len(hist)},
-        session_id=session_id,
-    ) as trace:
-        gen = trace.generation(
-            "llm",
-            model=model,
-            input=messages,
-            model_parameters={
-                "temperature": gen_cfg.get("temperature", 0.2),
-                "max_tokens": gen_cfg.get("max_tokens", 1024),
-            },
-        )
-        with gen:
-            stream = client.chat.completions.create(
-                model=model,
-                temperature=gen_cfg.get("temperature", 0.2),
-                max_tokens=gen_cfg.get("max_tokens", 1024),
-                stream=True,
-                # Ask OpenAI for a final usage chunk so we can report token counts.
-                stream_options={"include_usage": True},
-                messages=messages,
-            )
-            parts: list[str] = []
-            usage: Any = None
-            for chunk in stream:
-                if chunk.usage is not None:
-                    usage = chunk.usage
-                delta = chunk.choices[0].delta.content if chunk.choices else None
-                if delta:
-                    parts.append(delta)
-                    yield delta
-            text = "".join(parts)
-            gen.end(output=text, usage=_usage_dict(usage))
-            _fill_usage_sink(usage_sink, model, usage)
-        trace.end(output={"answer_chars": len(text)})
+        {"query": query, "num_sources": len(contexts)},
+        _SYSTEM_PROMPT,
+        build_answer_prompt(query, contexts),
+        cfg,
+        stream=True, client=client, session_id=session_id,
+        usage_sink=usage_sink, history=history, parent=parent,
+    )
 
 
 def _usage_dict(usage: Any) -> dict[str, int] | None:

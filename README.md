@@ -26,7 +26,7 @@ flowchart LR
 | 1. Parse | `parsing/` | Extract text from PDF pages (PyMuPDF) | ✅ Done |
 | 2. Structure | `parsing/toc.py`, `align.py` | Build PART / chapter / section tree from Contents | ✅ Done |
 | 3. Chunk | `chunking/` | Split text inside section boundaries with overlap | ✅ Done |
-| 4. Enrich | `enrichment/` | Add syllabus tags, entities, content types | ✅ Done |
+| 4. Enrich | `enrichment/` | Article entities + 'Articles at a Glance' catalog attribution | ✅ Done |
 | 5. Index | `indexing/` | Save `chunks.jsonl`; embed + upsert to Qdrant | ✅ Done |
 | 6. Retrieve | `retrieval/` | Dense (Qdrant) + BM25 hybrid search, RRF fusion, cross-encoder rerank | ✅ Done |
 | 7. Answer | `generation/` | LLM prompt with cited sources (OpenAI) | ✅ Done |
@@ -88,10 +88,8 @@ The graph **wraps the existing functions as thin nodes** — it does *not* reimp
 retriever, RRF, FlashRank rerank, or catalog logic — so retrieval/generation behavior (and the
 eval numbers) are unchanged; only orchestration differs. Sources are deduped identically by a
 shared `generation/sources.py` helper, and `/ask/stream` keeps the same NDJSON contract (the
-graph drives routing + retrieval, then tokens stream through `generate_answer_stream`). An
-optional `UPSC_RAG_LLM_BACKEND=langchain` flag routes generation through `ChatOpenAI`
-(`llm/clients.py`) as a provider-portability seam (off by default). See the `graph/` package and
-the `orchestration` stage in `progress.json`.
+graph drives routing + retrieval, then tokens stream through `generate_answer_stream`).
+See the `graph/` package and the `orchestration` stage in `progress.json`.
 
 ```powershell
 # run the backend on the LangGraph path (or "agentic" for the ReAct + web-search agent)
@@ -229,7 +227,7 @@ Structured-RAG/
 │   ├── config.py             # Load YAML + .env; resolve paths
 │   ├── parsing/              # PDF + TOC + alignment
 │   ├── chunking/             # Hierarchy-aware splitting
-│   ├── enrichment/           # syllabus_tags, entities
+│   ├── enrichment/           # 'Articles at a Glance' catalog parsing (articles_catalog.py)
 │   ├── indexing/             # JSONL store, OpenAI embedder, Qdrant store
 │   ├── retrieval/            # HybridRetriever (dense + BM25 + RRF), rewrite, cross-encoder rerank, web.py (DuckDuckGo)
 │   ├── generation/           # build_answer_prompt, generate_answer[_stream], condense, agentic synthesis, sources (dedupe)
@@ -350,7 +348,7 @@ so it's cheap, repeatable, and exactly the signal needed to tune retrieval.
 ```powershell
 python scripts/evaluate.py --rerank 8            # run the eval
 python scripts/evaluate.py --rerank 8 --no-rerank    # A/B a single layer
-#   flags: --no-rewrite | --no-graph | --no-catalog | --no-rerank
+#   flags: --no-rewrite | --no-catalog | --no-rerank
 ```
 
 ### Metrics and what they mean
@@ -606,7 +604,7 @@ per-answer cost of `gpt-4o-mini`, or `gpt-4.1-mini` at ~2×).
 - [x] Retrieval-quality eval harness + labeled gold set (hit@k, MRR, article_recall)
 - [x] Reranker (cross-encoder, FlashRank) blended with RRF candidates
 - [x] Generation-quality eval — 3 cheap signals (article recall, citation, groundedness) — no LLM judge
-- [x] LangGraph orchestration backend (parallel path behind `UPSC_RAG_PIPELINE=graph`) + LangChain LLM portability seam
+- [x] LangGraph orchestration backend (parallel path behind `UPSC_RAG_PIPELINE=graph`)
 - [x] LLM-judge rubric (faithfulness / completeness / exam-appropriateness / citation) cross-checked against the cheap signals (`gpt-5-mini`)
 - [x] Judge-driven tuning loop — prompt-faithfulness refinements + `gpt-4.1` generator lifted judge overall 3.43 → 4.01 (faithfulness 3.37 → 4.07)
 - [x] Conversation history — follow-ups condensed into standalone questions (`history` + `session_id` in the API)

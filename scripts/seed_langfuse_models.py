@@ -17,10 +17,14 @@ particular gpt-5-mini is a PLACEHOLDER; set it to the real price for your deploy
 """
 from __future__ import annotations
 
+import base64
+import json
 import os
 import sys
+import urllib.error
+import urllib.parse
+import urllib.request
 
-import requests
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -37,28 +41,34 @@ MODELS = [
 ]
 
 
-def _auth() -> tuple[str, tuple[str, str]]:
+def _auth() -> tuple[str, str]:
     host = os.environ.get("LANGFUSE_HOST", "http://localhost:3001").rstrip("/")
     pub = os.environ.get("LANGFUSE_PUBLIC_KEY", "")
     sec = os.environ.get("LANGFUSE_SECRET_KEY", "")
     if not (pub and sec):
         sys.exit("LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY missing from environment (.env).")
-    return host, (pub, sec)
+    basic = base64.b64encode(f"{pub}:{sec}".encode()).decode()
+    return host, f"Basic {basic}"
 
 
-def _existing_names(host: str, auth: tuple[str, str]) -> set[str]:
+def _request(url: str, auth: str, body: dict | None = None) -> dict:
+    """GET (body=None) or POST JSON with basic auth; returns the parsed JSON response."""
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(
+        url, data=data,
+        headers={"Authorization": auth, "Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return json.loads(resp.read() or b"{}")
+
+
+def _existing_names(host: str, auth: str) -> set[str]:
     """Return modelNames already defined for the project (all pages)."""
     names: set[str] = set()
     page = 1
     while True:
-        r = requests.get(
-            f"{host}/api/public/models",
-            params={"page": page, "limit": 100},
-            auth=auth,
-            timeout=15,
-        )
-        r.raise_for_status()
-        data = r.json().get("data", [])
+        params = urllib.parse.urlencode({"page": page, "limit": 100})
+        data = _request(f"{host}/api/public/models?{params}", auth).get("data", [])
         if not data:
             break
         names.update(m.get("modelName", "") for m in data)
@@ -72,7 +82,7 @@ def main() -> None:
     host, auth = _auth()
     try:
         existing = _existing_names(host, auth)
-    except requests.RequestException as exc:
+    except (urllib.error.URLError, OSError) as exc:
         sys.exit(f"Could not reach Langfuse at {host} (is the container up?): {exc}")
 
     created, skipped = [], []
@@ -87,9 +97,10 @@ def main() -> None:
             "inputPrice": in_price,
             "outputPrice": out_price,
         }
-        r = requests.post(f"{host}/api/public/models", json=body, auth=auth, timeout=15)
-        if r.status_code >= 300:
-            print(f"  ! {name}: HTTP {r.status_code} {r.text[:200]}")
+        try:
+            _request(f"{host}/api/public/models", auth, body)
+        except urllib.error.HTTPError as exc:
+            print(f"  ! {name}: HTTP {exc.code} {exc.read()[:200]!r}")
             continue
         created.append(name)
 

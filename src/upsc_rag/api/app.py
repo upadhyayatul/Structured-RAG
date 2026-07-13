@@ -18,7 +18,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -76,17 +75,9 @@ async def lifespan(app: FastAPI):
     _state.clear()
 
 
+# No CORS middleware: the browser talks to the Next.js proxy route (web/app/api/ask),
+# which forwards server-side — this API never receives cross-origin browser requests.
 app = FastAPI(title="UPSC-RAG API", lifespan=lifespan)
-
-# Allow the Next.js dev server (and prod origin) to call this API from the browser.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=os.environ.get(
-        "UPSC_RAG_CORS_ORIGINS", "http://localhost:3000"
-    ).split(","),
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 
 class Turn(BaseModel):
