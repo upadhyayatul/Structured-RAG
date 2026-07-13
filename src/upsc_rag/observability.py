@@ -15,28 +15,21 @@ Usage
 from __future__ import annotations
 
 import os
-import time
 from contextlib import contextmanager
 from typing import Any, Generator
 
 
-class _NoopSpan:
-    """Drop-in when Langfuse is not configured."""
-    def end(self, **kwargs: Any) -> None: ...
-    def span(self, name: str, **kwargs: Any) -> "_NoopContext": ...  # type: ignore[empty-body]
-    def generation(self, name: str, **kwargs: Any) -> "_NoopContext": ...  # type: ignore[empty-body]
-    def score(self, name: str, value: float, comment: str | None = None) -> None: ...
-
-
 class _NoopContext:
-    def __enter__(self) -> _NoopSpan:
-        return _NoopSpan()
+    """Drop-in span/trace when Langfuse is not configured: a context manager that
+    yields itself, so nesting (``with ctx.span(...) as s: s.generation(...)``) works."""
+    def __enter__(self) -> "_NoopContext":
+        return self
     def __exit__(self, *_: Any) -> None: ...
     def end(self, **kwargs: Any) -> None: ...
     def span(self, name: str, **kwargs: Any) -> "_NoopContext":
-        return _NoopContext()
+        return self
     def generation(self, name: str, **kwargs: Any) -> "_NoopContext":
-        return _NoopContext()
+        return self
     def score(self, name: str, value: float, comment: str | None = None) -> None: ...
 
 
@@ -45,7 +38,6 @@ class _LangfuseSpanContext:
 
     def __init__(self, span: Any) -> None:
         self._span = span
-        self._t0 = time.perf_counter()
 
     def __enter__(self) -> "_LangfuseSpanContext":
         return self
@@ -80,10 +72,6 @@ class _LangfuseSpanContext:
         fn = getattr(self._span, "score", None)
         if callable(fn):
             fn(name=name, value=value, comment=comment)
-
-    @property
-    def elapsed_ms(self) -> float:
-        return (time.perf_counter() - self._t0) * 1000
 
 
 class TraceManager:
