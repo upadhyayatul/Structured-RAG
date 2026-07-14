@@ -56,6 +56,9 @@ conversation:                # multi-turn: resolve follow-ups against recent cha
   history_turns: 3           # prior exchanges kept (N questions + N answers = 2N messages)
   condense_model: gpt-4.1-nano   # cheap LLM that rewrites a follow-up into a standalone search query
 
+answer_cache:                # exact-match question→answer cache (direct path only; web answers never cached)
+  enabled: true              # false = every question re-runs retrieval + generation
+
 agent:                       # tool-calling agentic pipeline (UPSC_RAG_PIPELINE=agentic): LLM decides textbook vs web search
   model: gpt-4o-mini         # agent model — must support tool/function calling
   temperature: 0.0           # deterministic tool-routing decisions

@@ -37,6 +37,8 @@ flowchart TB
     API["FastAPI · api/app.py<br/>/ask · /ask/stream · /health"]
     ORCH["Orchestration<br/>direct (default) | LangGraph (UPSC_RAG_PIPELINE=graph)"]
     SMALL{"smalltalk<br/>gate"}
+    CACHE{"answer cache<br/>exact-match sqlite (direct only)"}
+    QAC[("qa_cache.sqlite")]
     RET["HybridRetriever<br/>dense + BM25 → RRF → rerank → catalog"]
     OFF{"off-topic<br/>gate"}
     GEN["generate_answer<br/>OpenAI chat · grounded + cited [n]"]
@@ -44,9 +46,13 @@ flowchart TB
     OOS["out-of-scope reply"]
     UI --> BFF --> API --> ORCH --> SMALL
     SMALL -->|chit-chat| CANNED
-    SMALL -->|answer| RET --> OFF
+    SMALL -->|answer| CACHE
+    CACHE -->|"hit · replay, $0"| UI
+    CACHE -->|miss| RET --> OFF
     OFF -->|below floor| OOS
     OFF -->|in-scope| GEN --> UI
+    GEN -.->|"store (textbook-only)"| QAC
+    QAC -.-> CACHE
   end
 
   subgraph EVAL["Evaluation (offline harnesses, data/eval gold set)"]

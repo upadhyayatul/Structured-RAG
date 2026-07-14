@@ -34,6 +34,7 @@ flowchart TB
     subgraph DG["Request steps (shared by direct + graph)"]
       direction TB
       SMALL{"smalltalk gate"}:::gate
+      CACHE{"answer cache (direct only)<br/>api/cache.py · exact-match sqlite<br/>raw query first, then condensed"}:::gate
       RET["HybridRetriever<br/>dense + BM25 → RRF → rerank → catalog"]:::proc
       OFF{"off-topic gate"}:::gate
       SUFF{"sufficiency check<br/>do the sections answer it?"}:::gate
@@ -41,7 +42,9 @@ flowchart TB
       GEN["generate_answer<br/>grounded + cited [n]"]:::proc
       GENW["generate_agentic_answer<br/>textbook + web, cited"]:::proc
       SMALL -->|chit-chat| CANNED["canned reply"]:::proc
-      SMALL -->|answer| RET --> OFF
+      SMALL -->|answer| CACHE
+      CACHE -->|"hit · replay stored answer, $0"| HIT["cached answer"]:::proc
+      CACHE -->|miss| RET --> OFF
       OFF -->|below floor| OOS["out-of-scope reply"]:::proc
       OFF -->|in-scope| SUFF
       SUFF -->|sufficient| GEN
@@ -73,6 +76,11 @@ flowchart TB
     GEN --> UI
     GENW --> UI
     SYN --> UI
+    HIT --> UI
+
+    QAC[("qa_cache.sqlite<br/>question → answer + sources")]:::store
+    QAC -.->|lookup| CACHE
+    GEN -.->|"store (textbook-only answers)"| QAC
   end
 
   %% ---------------- AI gateway + providers ----------------
@@ -87,7 +95,7 @@ flowchart TB
   %% ---------------- Observability ----------------
   subgraph OBS["Observability (Langfuse)"]
     direction TB
-    LF["Langfuse · unified 'ask' root trace<br/>spans: rewrite · retrieve · sufficiency · web_search · generate<br/>live scores after the 'done' event (never blocks the stream):<br/>groundedness · citations · used_web"]:::gw
+    LF["Langfuse · unified 'ask' root trace<br/>spans: rewrite · retrieve · sufficiency · web_search · generate<br/>live scores after the 'done' event (never blocks the stream):<br/>groundedness · citations · used_web · cache_hit"]:::gw
   end
 
   %% ---------------- Evaluation ----------------

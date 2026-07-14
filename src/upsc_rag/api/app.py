@@ -21,6 +21,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from upsc_rag.api.cache import AnswerCache
 from upsc_rag.config import get_settings, load_runtime_config
 from upsc_rag.generation.answer import (
     generate_agentic_answer,
@@ -62,6 +63,11 @@ async def lifespan(app: FastAPI):
     _state["cfg"] = cfg
     retriever = HybridRetriever(cfg, chunks_path)
     _state["retriever"] = retriever
+    # Exact-match answer cache (direct path only — graph/agentic modes stay uncached).
+    if not (USE_GRAPH or USE_AGENTIC) and cfg.get("answer_cache", {}).get("enabled", True):
+        _state["answer_cache"] = AnswerCache(
+            settings.resolve(settings.processed_dir) / BOOK_ID / "qa_cache.sqlite"
+        )
     # Build the selected orchestration graph once (reused per request).
     if USE_GRAPH:
         from upsc_rag.graph import build_ask_graph
@@ -258,8 +264,24 @@ def ask(req: AskRequest) -> AskResponse:
     with trace_manager.trace(
         "ask", input={"query": req.query}, session_id=req.session_id
     ) as root:
-        # Resolve follow-ups: condense history + query into a standalone retrieval query.
-        history, search_query = _history_and_search_query(req, _state["cfg"], parent=root)
+        # Raw-query-first cache lookup: an identical repeat hits even when condense
+        # would reword it (e.g. expand an abbreviation), and a hit skips the condense
+        # LLM call too. On a raw miss, condense and try the standalone form.
+        cache: AnswerCache | None = _state.get("answer_cache")
+        cached = cache.get(req.query) if cache else None
+        if cached is None:
+            # Resolve follow-ups: condense history + query into a standalone retrieval query.
+            history, search_query = _history_and_search_query(req, _state["cfg"], parent=root)
+            if cache and search_query != req.query:
+                cached = cache.get(search_query)
+
+        # Cache hit: replay the stored answer — skip retrieval, gates, and generation.
+        if cached is not None:
+            answer, source_dicts = cached
+            root.score("cache_hit", 1.0)
+            root.end(output={"route": "cache_hit", "answer_chars": len(answer)})
+            return AskResponse(answer=answer, sources=[Source(**s) for s in source_dicts])
+
         results = retriever.retrieve(
             search_query, top_k=req.top_k, rerank_top_k=req.rerank_top_k,
             session_id=req.session_id, parent=root,
@@ -299,11 +321,17 @@ def ask(req: AskRequest) -> AskResponse:
             )
             sources = _build_sources(results)
 
+        # Cache textbook-only answers; web-fallback answers go stale, so never store them.
+        if cache and not web:
+            cache.put(search_query, answer, [s.model_dump() for s in sources])
+
         record_answer_scores(
             root, search_query, answer, _score_sources(results, web), _state["cfg"]
         )
-        # Filterable in Langfuse: how often does the book fail to answer on its own?
+        # Filterable in Langfuse: how often does the book fail to answer on its own,
+        # and what fraction of questions are served from cache?
         root.score("used_web", 1.0 if web else 0.0)
+        root.score("cache_hit", 0.0)
         root.end(output={"answer_chars": len(answer), "used_web": bool(web), "num_web": len(web)})
     return AskResponse(answer=answer, sources=sources)
 
@@ -418,8 +446,30 @@ def ask_stream(req: AskRequest) -> StreamingResponse:
                     "ask", input={"query": req.query}, session_id=req.session_id
                 )
                 yield _status(*_S_RETRIEVING)
-                # Resolve follow-ups into a standalone query, then search the textbook.
-                history, gen_query = _history_and_search_query(req, _state["cfg"], parent=root)
+                # Raw-query-first cache lookup: an identical repeat hits even when
+                # condense would reword it, and a hit skips the condense LLM call too.
+                cache: AnswerCache | None = _state.get("answer_cache")
+                cached = cache.get(req.query) if cache else None
+                if cached is None:
+                    # Resolve follow-ups into a standalone query for retrieval; on a raw
+                    # miss the condensed form gets a second cache chance.
+                    history, gen_query = _history_and_search_query(req, _state["cfg"], parent=root)
+                    if cache and gen_query != req.query:
+                        cached = cache.get(gen_query)
+
+                # Cache hit: replay the stored answer as one token event (same shape as
+                # canned_stream) — skip retrieval, gates, web fallback, and generation.
+                if cached is not None:
+                    answer, source_dicts = cached
+                    root.score("cache_hit", 1.0)
+                    trace_out = {"route": "cache_hit", "answer_chars": len(answer)}
+                    yield json.dumps({"type": "sources", "sources": source_dicts}) + "\n"
+                    yield json.dumps({"type": "token", "text": answer}) + "\n"
+                    yield json.dumps(
+                        {"type": "done", "cost_usd": 0.0, "input_tokens": 0, "output_tokens": 0}
+                    ) + "\n"
+                    return
+
                 results = retriever.retrieve(
                     gen_query, top_k=req.top_k, rerank_top_k=req.rerank_top_k,
                     session_id=req.session_id, parent=root,
@@ -479,13 +529,21 @@ def ask_stream(req: AskRequest) -> StreamingResponse:
                 "input_tokens": usage_sink.get("input_tokens", 0),
                 "output_tokens": usage_sink.get("output_tokens", 0),
             }) + "\n"
+            # Cache textbook-only answers (web ones go stale). _state has no cache in
+            # graph/agentic mode, so this is a no-op there.
+            if _state.get("answer_cache") and not web and parts:
+                _state["answer_cache"].put(
+                    gen_query, "".join(parts), [s.model_dump() for s in sources]
+                )
             # Score the full answer once streaming completes (tokens already sent).
             record_answer_scores(
                 root, gen_query, "".join(parts), _score_sources(results, web), _state["cfg"]
             )
-            # Filterable in Langfuse: how often does the book fail to answer on its own?
+            # Filterable in Langfuse: how often does the book fail to answer on its own,
+            # and what fraction of questions are served from cache?
             if root is not None:
                 root.score("used_web", 1.0 if web else 0.0)
+                root.score("cache_hit", 0.0)
         finally:
             # Close + flush the request root once the stream ends (or the client
             # disconnects). No-op in graph mode where root is None.
