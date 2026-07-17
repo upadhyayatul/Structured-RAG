@@ -1,6 +1,7 @@
 """Config loading: merges default.yaml with per-book YAML and exposes typed settings objects."""
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -69,7 +70,12 @@ def load_runtime_config(book_id: str = "laxmikanth_6") -> dict[str, Any]:
     if not book_path.exists():
         raise FileNotFoundError(f"Book config not found: {book_path}")
     book = _load_yaml(book_path)
-    return _deep_merge(default, book)
+    merged = _deep_merge(default, book)
+    # Env override for containerised deploys — the YAML default (localhost:6333) can't
+    # reach Qdrant from inside a container.
+    if qdrant_url := os.environ.get("UPSC_RAG_QDRANT_URL"):
+        merged.setdefault("indexing", {})["qdrant_url"] = qdrant_url
+    return merged
 
 
 @lru_cache

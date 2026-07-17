@@ -174,6 +174,14 @@ export default function Home() {
             }
             answer += evt.text;
             patchLast({ content: answer });
+          } else if (evt.type === "error") {
+            // Upstream failure signalled in-band (a 503 can't be sent once the stream
+            // has started). Show it as an error; a "done" event follows.
+            patchLast({
+              content: (evt.message as string) ?? "Something went wrong",
+              error: true,
+              streaming: false,
+            });
           } else if (evt.type === "done") {
             // "done" marks the end of the answer; the connection stays open a few
             // more seconds for backend scoring + trace flush, so don't wait for

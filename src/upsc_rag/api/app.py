@@ -10,6 +10,7 @@ across requests. The Next.js frontend POSTs to /ask and renders {answer, sources
 from __future__ import annotations
 
 import json
+import logging
 import os
 from contextlib import asynccontextmanager
 from typing import Any, Iterator, Literal
@@ -17,11 +18,30 @@ from typing import Any, Iterator, Literal
 from dotenv import load_dotenv
 load_dotenv()
 
+import httpx
 from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from openai import OpenAIError
 from pydantic import BaseModel, Field
+from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
 
+log = logging.getLogger("upsc_rag.api")
+
+# Dependency failures we translate into a graceful response instead of a 500 stack trace:
+# OpenAI (LLM + embeddings), Qdrant (both its own errors and the httpx transport under it),
+# plus generic connection/timeout. Narrow on purpose — real code bugs still surface as 500.
+UPSTREAM_ERRORS = (
+    OpenAIError, httpx.HTTPError, ResponseHandlingException, UnexpectedResponse,
+    ConnectionError, TimeoutError,
+)
+SERVICE_UNAVAILABLE_MSG = "The service is temporarily unavailable. Please try again in a moment."
+# Generation-down fallback: retrieval succeeded, so we still hand back the cited sources.
+GENERATION_UNAVAILABLE_MSG = (
+    "I couldn't generate a written answer right now, but here are the most relevant "
+    "sources for your question."
+)
+
+from upsc_rag.api.cache import AnswerCache
 from upsc_rag.config import get_settings, load_runtime_config
 from upsc_rag.generation.answer import (
     generate_agentic_answer,
@@ -63,6 +83,11 @@ async def lifespan(app: FastAPI):
     _state["cfg"] = cfg
     retriever = HybridRetriever(cfg, chunks_path)
     _state["retriever"] = retriever
+    # Exact-match answer cache (direct path only — graph/agentic modes stay uncached).
+    if not (USE_GRAPH or USE_AGENTIC) and cfg.get("answer_cache", {}).get("enabled", True):
+        _state["answer_cache"] = AnswerCache(
+            settings.resolve(settings.processed_dir) / BOOK_ID / "qa_cache.sqlite"
+        )
     # Build the selected orchestration graph once (reused per request).
     if USE_GRAPH:
         from upsc_rag.graph import build_ask_graph
@@ -76,17 +101,9 @@ async def lifespan(app: FastAPI):
     _state.clear()
 
 
+# No CORS middleware: the browser talks to the Next.js proxy route (web/app/api/ask),
+# which forwards server-side — this API never receives cross-origin browser requests.
 app = FastAPI(title="UPSC-RAG API", lifespan=lifespan)
-
-# Allow the Next.js dev server (and prod origin) to call this API from the browser.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=os.environ.get(
-        "UPSC_RAG_CORS_ORIGINS", "http://localhost:3000"
-    ).split(","),
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 
 class Turn(BaseModel):
@@ -231,8 +248,23 @@ def _score_sources(
 
 @app.get("/health")
 def health() -> dict[str, str]:
-    """Liveness check; reports whether the retriever is loaded."""
-    return {"status": "ok" if "retriever" in _state else "loading", "book": BOOK_ID}
+    """Readiness check: retriever loaded AND Qdrant reachable.
+
+    Pings Qdrant so an orchestrator/load-balancer routes away from an instance whose
+    vector store is down, instead of it silently 500-ing every /ask. Returns 503 when
+    not ready so the check fails loudly.
+    """
+    retriever: HybridRetriever | None = _state.get("retriever")
+    if retriever is None:
+        raise HTTPException(status_code=503, detail={"status": "loading", "book": BOOK_ID})
+    try:
+        retriever._qdrant.get_collections()  # cheap liveness ping (client has a 5s timeout)
+    except UPSTREAM_ERRORS as e:
+        log.warning("health: Qdrant unreachable: %s", e)
+        raise HTTPException(
+            status_code=503, detail={"status": "degraded", "qdrant": "unreachable", "book": BOOK_ID}
+        )
+    return {"status": "ok", "book": BOOK_ID}
 
 
 @app.post("/ask", response_model=AskResponse)
@@ -250,10 +282,14 @@ def ask(req: AskRequest) -> AskResponse:
             from upsc_rag.graph import run_ask
 
         history = [t.model_dump() for t in req.history] if req.history else None
-        final = run_ask(
-            _state["graph"], req.query, top_k=req.top_k,
-            rerank_top_k=req.rerank_top_k, session_id=req.session_id, history=history,
-        )
+        try:
+            final = run_ask(
+                _state["graph"], req.query, top_k=req.top_k,
+                rerank_top_k=req.rerank_top_k, session_id=req.session_id, history=history,
+            )
+        except UPSTREAM_ERRORS as e:
+            log.warning("ask (graph/agentic) upstream failure: %s", e)
+            raise HTTPException(status_code=503, detail=SERVICE_UNAVAILABLE_MSG)
         sources = [Source(**s) for s in final.get("sources", [])]
         return AskResponse(answer=final.get("answer", ""), sources=sources)
 
@@ -267,52 +303,88 @@ def ask(req: AskRequest) -> AskResponse:
     with trace_manager.trace(
         "ask", input={"query": req.query}, session_id=req.session_id
     ) as root:
-        # Resolve follow-ups: condense history + query into a standalone retrieval query.
-        history, search_query = _history_and_search_query(req, _state["cfg"], parent=root)
-        results = retriever.retrieve(
-            search_query, top_k=req.top_k, rerank_top_k=req.rerank_top_k,
-            session_id=req.session_id, parent=root,
-        )
+        # Retrieval + gates: any dependency failure here (Qdrant, query embedding, the
+        # condense/sufficiency LLM calls) leaves us with nothing to ground on — return a
+        # clean 503 rather than a 500 stack trace.
+        try:
+            # Raw-query-first cache lookup: an identical repeat hits even when condense
+            # would reword it (e.g. expand an abbreviation), and a hit skips the condense
+            # LLM call too. On a raw miss, condense and try the standalone form.
+            cache: AnswerCache | None = _state.get("answer_cache")
+            cached = cache.get(req.query) if cache else None
+            if cached is None:
+                # Resolve follow-ups: condense history + query into a standalone retrieval query.
+                history, search_query = _history_and_search_query(req, _state["cfg"], parent=root)
+                if cache and search_query != req.query:
+                    cached = cache.get(search_query)
 
-        # Gate 2: real question, but no relevant source in the book — skip generation.
-        floor = _state["cfg"].get("retrieval", {}).get("relevance_floor", 0.0)
-        if is_off_topic(results, floor):
-            root.end(output={"route": "out_of_scope"})
-            return AskResponse(answer=OUT_OF_SCOPE_REPLY, sources=[])
+            # Cache hit: replay the stored answer — skip retrieval, gates, and generation.
+            if cached is not None:
+                answer, source_dicts = cached
+                root.score("cache_hit", 1.0)
+                root.end(output={"route": "cache_hit", "answer_chars": len(answer)})
+                return AskResponse(answer=answer, sources=[Source(**s) for s in source_dicts])
 
-        # Gate 3: on-topic, but do the retrieved sections actually ANSWER it? If not (the
-        # framers' intent, post-2011 events, current office-holders), search the web and
-        # answer over textbook + web instead of replying "the sources do not specify".
-        web: list[dict[str, Any]] = []
-        if not sources_answer_question(
-            search_query, results, _state["cfg"], session_id=req.session_id, parent=root
-        ):
-            web = _run_web_search(search_query, _state["cfg"], req.session_id, root)
+            results = retriever.retrieve(
+                search_query, top_k=req.top_k, rerank_top_k=req.rerank_top_k,
+                session_id=req.session_id, parent=root,
+            )
 
+            # Gate 2: real question, but no relevant source in the book — skip generation.
+            floor = _state["cfg"].get("retrieval", {}).get("relevance_floor", 0.0)
+            if is_off_topic(results, floor):
+                root.end(output={"route": "out_of_scope"})
+                return AskResponse(answer=OUT_OF_SCOPE_REPLY, sources=[])
+
+            # Gate 3: on-topic, but do the retrieved sections actually ANSWER it? If not (the
+            # framers' intent, post-2011 events, current office-holders), search the web and
+            # answer over textbook + web instead of replying "the sources do not specify".
+            web: list[dict[str, Any]] = []
+            if not sources_answer_question(
+                search_query, results, _state["cfg"], session_id=req.session_id, parent=root
+            ):
+                web = _run_web_search(search_query, _state["cfg"], req.session_id, root)
+        except UPSTREAM_ERRORS as e:
+            log.warning("ask upstream failure (retrieval/gates): %s", e)
+            raise HTTPException(status_code=503, detail=SERVICE_UNAVAILABLE_MSG)
+
+        # Generation gets its own guard: retrieval already succeeded, so if only the LLM is
+        # down we still hand back the cited sources (grounded) instead of failing the request.
         # Generate from the CONDENSED question, not the raw one: it has the follow-up's
         # references and abbreviations resolved ("from where was the FD taken?" ->
-        # "...Fundamental Duties..."). Given the raw form, the answer LLM decodes the
-        # abbreviation from the conversation's topic and answers the wrong question even
-        # when retrieval fetched the right sources. On a first turn (no history) condense
-        # is a no-op, so this IS req.query.
-        if web:
-            answer = generate_agentic_answer(
-                search_query, results, web, _state["cfg"], session_id=req.session_id,
-                history=history, parent=root,
-            )
-            sources = [Source(**s) for s in build_agentic_sources(results, web)]
-        else:
-            answer = generate_answer(
-                search_query, results, _state["cfg"], session_id=req.session_id,
-                history=history, parent=root,
-            )
-            sources = _build_sources(results)
+        # "...Fundamental Duties..."). On a first turn (no history) condense is a no-op.
+        try:
+            if web:
+                answer = generate_agentic_answer(
+                    search_query, results, web, _state["cfg"], session_id=req.session_id,
+                    history=history, parent=root,
+                )
+                sources = [Source(**s) for s in build_agentic_sources(results, web)]
+            else:
+                answer = generate_answer(
+                    search_query, results, _state["cfg"], session_id=req.session_id,
+                    history=history, parent=root,
+                )
+                sources = _build_sources(results)
+        except UPSTREAM_ERRORS as e:
+            log.warning("ask generation failed, returning sources only: %s", e)
+            sources = ([Source(**s) for s in build_agentic_sources(results, web)] if web
+                       else _build_sources(results))
+            root.score("generation_failed", 1.0)
+            root.end(output={"route": "generation_unavailable", "num_sources": len(sources)})
+            return AskResponse(answer=GENERATION_UNAVAILABLE_MSG, sources=sources)
+
+        # Cache textbook-only answers; web-fallback answers go stale, so never store them.
+        if cache and not web:
+            cache.put(search_query, answer, [s.model_dump() for s in sources])
 
         record_answer_scores(
             root, search_query, answer, _score_sources(results, web), _state["cfg"]
         )
-        # Filterable in Langfuse: how often does the book fail to answer on its own?
+        # Filterable in Langfuse: how often does the book fail to answer on its own,
+        # and what fraction of questions are served from cache?
         root.score("used_web", 1.0 if web else 0.0)
+        root.score("cache_hit", 0.0)
         root.end(output={"answer_chars": len(answer), "used_web": bool(web), "num_web": len(web)})
     return AskResponse(answer=answer, sources=sources)
 
@@ -427,8 +499,30 @@ def ask_stream(req: AskRequest) -> StreamingResponse:
                     "ask", input={"query": req.query}, session_id=req.session_id
                 )
                 yield _status(*_S_RETRIEVING)
-                # Resolve follow-ups into a standalone query, then search the textbook.
-                history, gen_query = _history_and_search_query(req, _state["cfg"], parent=root)
+                # Raw-query-first cache lookup: an identical repeat hits even when
+                # condense would reword it, and a hit skips the condense LLM call too.
+                cache: AnswerCache | None = _state.get("answer_cache")
+                cached = cache.get(req.query) if cache else None
+                if cached is None:
+                    # Resolve follow-ups into a standalone query for retrieval; on a raw
+                    # miss the condensed form gets a second cache chance.
+                    history, gen_query = _history_and_search_query(req, _state["cfg"], parent=root)
+                    if cache and gen_query != req.query:
+                        cached = cache.get(gen_query)
+
+                # Cache hit: replay the stored answer as one token event (same shape as
+                # canned_stream) — skip retrieval, gates, web fallback, and generation.
+                if cached is not None:
+                    answer, source_dicts = cached
+                    root.score("cache_hit", 1.0)
+                    trace_out = {"route": "cache_hit", "answer_chars": len(answer)}
+                    yield json.dumps({"type": "sources", "sources": source_dicts}) + "\n"
+                    yield json.dumps({"type": "token", "text": answer}) + "\n"
+                    yield json.dumps(
+                        {"type": "done", "cost_usd": 0.0, "input_tokens": 0, "output_tokens": 0}
+                    ) + "\n"
+                    return
+
                 results = retriever.retrieve(
                     gen_query, top_k=req.top_k, rerank_top_k=req.rerank_top_k,
                     session_id=req.session_id, parent=root,
@@ -479,22 +573,56 @@ def ask_stream(req: AskRequest) -> StreamingResponse:
                     usage_sink=usage_sink, history=history, parent=root,
                 )
             )
-            for delta in stream:
-                parts.append(delta)
-                yield json.dumps({"type": "token", "text": delta}) + "\n"
+            try:
+                for delta in stream:
+                    parts.append(delta)
+                    yield json.dumps({"type": "token", "text": delta}) + "\n"
+            except UPSTREAM_ERRORS as e:
+                # Sources were already sent; the LLM is down. Deliver a grounded fallback
+                # message (or a note if we were mid-answer) + done, so the client shows the
+                # cited sources instead of a truncated/dropped stream. Don't cache/score.
+                log.warning("stream generation failed, returning sources only: %s", e)
+                yield json.dumps({"type": "token", "text": (
+                    GENERATION_UNAVAILABLE_MSG if not parts
+                    else "\n\n_(answer interrupted — please try again)_"
+                )}) + "\n"
+                trace_out = {"route": "generation_unavailable", "num_sources": len(sources)}
+                yield json.dumps(
+                    {"type": "done", "cost_usd": 0.0, "input_tokens": 0, "output_tokens": 0}
+                ) + "\n"
+                return
             yield json.dumps({
                 "type": "done",
                 "cost_usd": usage_sink.get("cost_usd", 0.0),
                 "input_tokens": usage_sink.get("input_tokens", 0),
                 "output_tokens": usage_sink.get("output_tokens", 0),
             }) + "\n"
+            # Cache textbook-only answers (web ones go stale). _state has no cache in
+            # graph/agentic mode, so this is a no-op there.
+            if _state.get("answer_cache") and not web and parts:
+                _state["answer_cache"].put(
+                    gen_query, "".join(parts), [s.model_dump() for s in sources]
+                )
             # Score the full answer once streaming completes (tokens already sent).
             record_answer_scores(
                 root, gen_query, "".join(parts), _score_sources(results, web), _state["cfg"]
             )
-            # Filterable in Langfuse: how often does the book fail to answer on its own?
+            # Filterable in Langfuse: how often does the book fail to answer on its own,
+            # and what fraction of questions are served from cache?
             if root is not None:
                 root.score("used_web", 1.0 if web else 0.0)
+                root.score("cache_hit", 0.0)
+        except UPSTREAM_ERRORS as e:
+            # Failed before any answer streamed (Qdrant / query embedding / a gate LLM).
+            # Can't send a 503 — headers are already out — so signal in-band: an 'error'
+            # event plus 'done' so the client's done-handler fires instead of hanging on a
+            # dropped connection.
+            log.warning("stream upstream failure (retrieval/gates): %s", e)
+            trace_out = {"route": "service_unavailable"}
+            yield json.dumps({"type": "error", "message": SERVICE_UNAVAILABLE_MSG}) + "\n"
+            yield json.dumps(
+                {"type": "done", "cost_usd": 0.0, "input_tokens": 0, "output_tokens": 0}
+            ) + "\n"
         finally:
             # Close + flush the request root once the stream ends (or the client
             # disconnects). No-op in graph mode where root is None.

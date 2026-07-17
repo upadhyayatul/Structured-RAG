@@ -1,3 +1,1 @@
-from upsc_rag.enrichment.metadata import enrich_chunk
-
-__all__ = ["enrich_chunk"]
+"""Chunk enrichment: parsing 'Articles ... at a Glance' catalogs (see articles_catalog.py)."""

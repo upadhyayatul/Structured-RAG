@@ -54,7 +54,7 @@ def run_embed(book_id: str, chunks_path: Path | None = None) -> None:
     vectors = embed_texts(texts, model=embedding_model, batch_size=batch_size)
     print(f"  Done — {len(vectors)} vectors produced")
 
-    client = QdrantClient(url=qdrant_url)
+    client = QdrantClient(url=qdrant_url, timeout=30)  # generous — upsert batches are large
     ensure_collection(client, collection_name, embedding_dim)
 
     print(f"Upserting into Qdrant collection '{collection_name}'…")

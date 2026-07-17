@@ -26,7 +26,7 @@ flowchart LR
 | 1. Parse | `parsing/` | Extract text from PDF pages (PyMuPDF) | ✅ Done |
 | 2. Structure | `parsing/toc.py`, `align.py` | Build PART / chapter / section tree from Contents | ✅ Done |
 | 3. Chunk | `chunking/` | Split text inside section boundaries with overlap | ✅ Done |
-| 4. Enrich | `enrichment/` | Add syllabus tags, entities, content types | ✅ Done |
+| 4. Enrich | `enrichment/` | Article entities + 'Articles at a Glance' catalog attribution | ✅ Done |
 | 5. Index | `indexing/` | Save `chunks.jsonl`; embed + upsert to Qdrant | ✅ Done |
 | 6. Retrieve | `retrieval/` | Dense (Qdrant) + BM25 hybrid search, RRF fusion, cross-encoder rerank | ✅ Done |
 | 7. Answer | `generation/` | LLM prompt with cited sources (OpenAI) | ✅ Done |
@@ -34,7 +34,7 @@ flowchart LR
 | 9. UI | `web/` | Next.js streaming chat with citations | ✅ Done |
 | 10. Evaluate | `eval/` | Retrieval, cheap generation-quality, and LLM-judge harnesses on a labeled gold set | 🟡 In progress |
 
-**Current status:** Full pipeline works end-to-end — ingest → embed → hybrid retrieve → LLM answer, exposed via FastAPI and a Next.js chat UI with token streaming (restyled as a retro **government-dossier theme**: typewriter fonts, aged-paper palette, rubber-stamp provenance badges). The direct path now carries a **sufficiency-gated web fallback** (post-2011 topics the 2011 book can't cover get DuckDuckGo results synthesized alongside the textbook), follow-up questions are **condensed with conversation history**, every chat call can route through a **LiteLLM AI gateway**, and each request emits a unified **Langfuse** trace with live quality scores. Three evaluation harnesses are in place (see [Evaluation](#evaluation)): retrieval quality (**70-question gold set** — hit@k 98.6 %, MRR 0.802), a cheap generation-quality harness (groundedness + citation), and a nuanced **LLM-judge rubric** (`gpt-5-mini`) that cross-checks the cheap signals. The judge drove a tuning loop (prompt-faithfulness pass + `gpt-4.1` generator) that lifted overall answer quality from **3.43 → 4.01 / 5**; the open levers are citation precision and the production-generator cost decision. See `progress.json` for details.
+**Current status:** Full pipeline works end-to-end — ingest → embed → hybrid retrieve → LLM answer, exposed via FastAPI and a Next.js chat UI with token streaming (restyled as a retro **government-dossier theme**: typewriter fonts, aged-paper palette, rubber-stamp provenance badges). The direct path now carries a **sufficiency-gated web fallback** (post-2011 topics the 2011 book can't cover get DuckDuckGo results synthesized alongside the textbook), follow-up questions are **condensed with conversation history**, repeated questions are served from a **persistent answer cache** (sqlite, $0 and sub-second on a hit), every chat call can route through a **LiteLLM AI gateway**, and each request emits a unified **Langfuse** trace with live quality scores. Three evaluation harnesses are in place (see [Evaluation](#evaluation)): retrieval quality (**70-question gold set** — hit@k 98.6 %, MRR 0.802), a cheap generation-quality harness (groundedness + citation), and a nuanced **LLM-judge rubric** (`gpt-5-mini`) that cross-checks the cheap signals. The judge drove a tuning loop (prompt-faithfulness pass + `gpt-4.1` generator) that lifted overall answer quality from **3.43 → 4.01 / 5**; the open levers are citation precision and the production-generator cost decision. See `progress.json` for details.
 
 ---
 
@@ -88,10 +88,8 @@ The graph **wraps the existing functions as thin nodes** — it does *not* reimp
 retriever, RRF, FlashRank rerank, or catalog logic — so retrieval/generation behavior (and the
 eval numbers) are unchanged; only orchestration differs. Sources are deduped identically by a
 shared `generation/sources.py` helper, and `/ask/stream` keeps the same NDJSON contract (the
-graph drives routing + retrieval, then tokens stream through `generate_answer_stream`). An
-optional `UPSC_RAG_LLM_BACKEND=langchain` flag routes generation through `ChatOpenAI`
-(`llm/clients.py`) as a provider-portability seam (off by default). See the `graph/` package and
-the `orchestration` stage in `progress.json`.
+graph drives routing + retrieval, then tokens stream through `generate_answer_stream`).
+See the `graph/` package and the `orchestration` stage in `progress.json`.
 
 ```powershell
 # run the backend on the LangGraph path (or "agentic" for the ReAct + web-search agent)
@@ -119,11 +117,24 @@ The frontend sends the last few completed exchanges with each request (`history`
 standalone question using that history, and the condensed query feeds both retrieval and
 generation. One browser session = one Langfuse session for trace grouping.
 
+### Answer cache (direct path)
+
+Repeated questions skip the whole pipeline: an **exact-match sqlite cache** (`api/cache.py`,
+stored at `data/processed/<book>/qa_cache.sqlite`) replays the stored answer + sources for
+$0 in well under a second. The key is the **normalized** question (lowercased, whitespace
+collapsed, trailing punctuation stripped), looked up **raw-query-first** — an identical
+repeat hits even mid-conversation, before the condense LLM call runs — with the condensed
+standalone form as a second chance for follow-ups. Only **textbook-only** answers are
+stored (the book never changes, so no TTL); web-fallback answers go stale and are never
+cached. Toggle via `answer_cache.enabled` in `config/default.yaml`; delete the sqlite file
+to clear. Hits are visible in Langfuse as `route: cache_hit`, and every direct-path trace
+carries a `cache_hit` score (mean = your cache hit rate).
+
 ### Observability (Langfuse)
 
 Every `/ask` request on the direct path emits **one unified `ask` root trace** with per-step
 spans — rewrite, retrieve, sufficiency, web_search, generate — plus **live scores** computed
-right after the answer finishes (grounded_fraction, citation validity, `used_web`, retrieval
+right after the answer finishes (grounded_fraction, citation validity, `used_web`, `cache_hit`, retrieval
 top-score). Scoring runs *after* the `done` NDJSON event is sent, so it never delays the
 answer: the UI reveals the finished answer at `done` while the backend spends a few more
 seconds scoring and flushing the trace. Langfuse ships in `docker-compose.yml`; keys live in
@@ -215,7 +226,8 @@ Structured-RAG/
 ├── data/processed/laxmikanth_6/
 │   ├── manifest.json         # Book metadata + page count
 │   ├── toc.json              # Parsed TOC tree (cached)
-│   └── chunks.jsonl          # Parent + child chunks (index input)
+│   ├── chunks.jsonl          # Parent + child chunks (index input)
+│   └── qa_cache.sqlite       # Answer cache (generated at runtime; safe to delete)
 │
 ├── scripts/                  # Thin CLI wrappers
 │   ├── calibrate_pages.py    # Verify PDF page ranges before ingest
@@ -229,14 +241,14 @@ Structured-RAG/
 │   ├── config.py             # Load YAML + .env; resolve paths
 │   ├── parsing/              # PDF + TOC + alignment
 │   ├── chunking/             # Hierarchy-aware splitting
-│   ├── enrichment/           # syllabus_tags, entities
+│   ├── enrichment/           # 'Articles at a Glance' catalog parsing (articles_catalog.py)
 │   ├── indexing/             # JSONL store, OpenAI embedder, Qdrant store
 │   ├── retrieval/            # HybridRetriever (dense + BM25 + RRF), rewrite, cross-encoder rerank, web.py (DuckDuckGo)
 │   ├── generation/           # build_answer_prompt, generate_answer[_stream], condense, agentic synthesis, sources (dedupe)
 │   ├── graph/                # LangGraph orchestration (UPSC_RAG_PIPELINE=graph): state, nodes, build, runner
 │   ├── agent/                # Agentic ReAct pipeline (UPSC_RAG_PIPELINE=agentic): tools, nodes, build, runner
 │   ├── llm/                  # clients.py — get_openai_client() gateway factory + ChatOpenAI/OpenAIEmbeddings seam
-│   ├── api/                  # FastAPI app (/ask, /ask/stream, /health)
+│   ├── api/                  # FastAPI app (/ask, /ask/stream, /health) + answer cache (cache.py)
 │   ├── eval/                 # retrieval-quality harness (hit@k, MRR, article_recall)
 │   └── pipeline/             # run_ingest, run_embed orchestration
 │
@@ -265,6 +277,7 @@ Configuration is split so one codebase can ingest many books. `default.yaml` hol
 | `indexing.qdrant_url` | `http://localhost:6333` |
 | `retrieval.top_k` / `rerank_top_k` | Candidate pool size and final results |
 | `generation.model` / `temperature` / `max_tokens` | LLM settings (`gpt-4o-mini`) |
+| `answer_cache.enabled` | Exact-match question→answer cache on the direct path (`true` by default) |
 
 Add new books by creating `config/books/<book_id>.yaml` (see "Adding a new book" in `CLAUDE.md`).
 
@@ -350,7 +363,7 @@ so it's cheap, repeatable, and exactly the signal needed to tune retrieval.
 ```powershell
 python scripts/evaluate.py --rerank 8            # run the eval
 python scripts/evaluate.py --rerank 8 --no-rerank    # A/B a single layer
-#   flags: --no-rewrite | --no-graph | --no-catalog | --no-rerank
+#   flags: --no-rewrite | --no-catalog | --no-rerank
 ```
 
 ### Metrics and what they mean
@@ -606,7 +619,7 @@ per-answer cost of `gpt-4o-mini`, or `gpt-4.1-mini` at ~2×).
 - [x] Retrieval-quality eval harness + labeled gold set (hit@k, MRR, article_recall)
 - [x] Reranker (cross-encoder, FlashRank) blended with RRF candidates
 - [x] Generation-quality eval — 3 cheap signals (article recall, citation, groundedness) — no LLM judge
-- [x] LangGraph orchestration backend (parallel path behind `UPSC_RAG_PIPELINE=graph`) + LangChain LLM portability seam
+- [x] LangGraph orchestration backend (parallel path behind `UPSC_RAG_PIPELINE=graph`)
 - [x] LLM-judge rubric (faithfulness / completeness / exam-appropriateness / citation) cross-checked against the cheap signals (`gpt-5-mini`)
 - [x] Judge-driven tuning loop — prompt-faithfulness refinements + `gpt-4.1` generator lifted judge overall 3.43 → 4.01 (faithfulness 3.37 → 4.07)
 - [x] Conversation history — follow-ups condensed into standalone questions (`history` + `session_id` in the API)

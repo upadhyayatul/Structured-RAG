@@ -17,10 +17,11 @@ def main() -> None:
     parser.add_argument("--book", default="laxmikanth_6")
     parser.add_argument("--rerank", type=int, default=None, help="Top-k results to score")
     parser.add_argument("--no-rewrite", action="store_true", help="Disable query rewriting for this run")
-    parser.add_argument("--no-graph", action="store_true", help="Disable graph expansion for this run")
     parser.add_argument("--no-catalog", action="store_true", help="Disable chapter article-catalog enrichment for this run")
     parser.add_argument("--no-rerank", action="store_true", help="Disable cross-encoder reranking for this run")
     parser.add_argument("--gold", default=None, help="Path to gold jsonl (default data/eval/<book>.jsonl)")
+    parser.add_argument("--min-hit-at-k", type=float, default=None,
+                        help="Exit non-zero if hit@k falls below this (0-1) — for CI gating")
     args = parser.parse_args()
 
     settings = get_settings()
@@ -28,9 +29,6 @@ def main() -> None:
     if args.no_rewrite:
         cfg = {**cfg, "retrieval": {**cfg.get("retrieval", {}),
                                     "rewrite": {**cfg.get("retrieval", {}).get("rewrite", {}), "enabled": False}}}
-    if args.no_graph:
-        cfg = {**cfg, "retrieval": {**cfg.get("retrieval", {}),
-                                    "graph": {**cfg.get("retrieval", {}).get("graph", {}), "enabled": False}}}
     if args.no_catalog:
         cfg = {**cfg, "retrieval": {**cfg.get("retrieval", {}),
                                     "catalog": {**cfg.get("retrieval", {}).get("catalog", {}), "enabled": False}}}
@@ -43,7 +41,7 @@ def main() -> None:
 
     gold = load_gold(gold_path)
     print(f"Loaded {len(gold)} gold questions from {gold_path}")
-    print(f"Rewrite: {'OFF' if args.no_rewrite else 'ON'}  |  Graph: {'OFF' if args.no_graph else 'ON'}"
+    print(f"Rewrite: {'OFF' if args.no_rewrite else 'ON'}"
           f"  |  Catalog: {'OFF' if args.no_catalog else 'ON'}  |  Rerank: {'OFF' if args.no_rerank else 'ON'}\n")
 
     retriever = HybridRetriever(cfg, processed / "chunks.jsonl")
@@ -63,6 +61,11 @@ def main() -> None:
     aah = report["avg_articles_on_hit"]
     print(f"  avg_articles/hit: {aah:.1f}  (articles attached to the gold section — lower = less over-attach)"
           if aah is not None else "  avg_articles/hit: n/a")
+
+    if args.min_hit_at_k is not None and report["hit_at_k"] < args.min_hit_at_k:
+        raise SystemExit(
+            f"\nFAIL: hit@k {report['hit_at_k']:.2%} < threshold {args.min_hit_at_k:.2%}"
+        )
 
 
 if __name__ == "__main__":

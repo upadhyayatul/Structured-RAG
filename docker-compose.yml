@@ -17,6 +17,29 @@ services:
       # Named volume so the upsc_polity collection survives restarts/recreates.
       - qdrant_storage:/qdrant/storage
 
+  api:
+    # The FastAPI backend, built from ./Dockerfile (no pre-built image exists — it's our code).
+    # GOTCHA: this only serves answers once Qdrant is POPULATED. A fresh qdrant_storage volume
+    # is empty; run `docker-compose run --rm api python scripts/embed.py --book laxmikanth_6`
+    # once (costs OpenAI tokens) to fill it. The external qdrant_storage volume below already
+    # holds the collection, so on this machine it just works.
+    build: .
+    image: upsc-rag-api:latest   # ← would name the image this instead
+    container_name: upsc-rag-api
+    restart: unless-stopped
+    depends_on:
+      - qdrant-db
+    ports:
+      - "8000:8000"   # Swagger at http://localhost:8000/docs; frontend proxies here.
+    environment:
+      OPENAI_API_KEY: "${OPENAI_API_KEY}"
+      # Service name, not localhost — inside the container Qdrant lives at qdrant-db:6333.
+      UPSC_RAG_QDRANT_URL: "http://qdrant-db:6333"
+      UPSC_RAG_BOOK: "${UPSC_RAG_BOOK:-laxmikanth_6}"
+      # Optional orchestration backend: "" (direct), "graph", or "agentic".
+      UPSC_RAG_PIPELINE: "${UPSC_RAG_PIPELINE:-}"
+      # To enable the optional gateways FROM INSIDE this container, point them at the
+      # service names (http://litellm:4000, http://langfuse:3000), not localhost.
 
   langfuse-db:
     image: postgres:15
