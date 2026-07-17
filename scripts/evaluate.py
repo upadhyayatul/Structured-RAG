@@ -20,6 +20,8 @@ def main() -> None:
     parser.add_argument("--no-catalog", action="store_true", help="Disable chapter article-catalog enrichment for this run")
     parser.add_argument("--no-rerank", action="store_true", help="Disable cross-encoder reranking for this run")
     parser.add_argument("--gold", default=None, help="Path to gold jsonl (default data/eval/<book>.jsonl)")
+    parser.add_argument("--min-hit-at-k", type=float, default=None,
+                        help="Exit non-zero if hit@k falls below this (0-1) — for CI gating")
     args = parser.parse_args()
 
     settings = get_settings()
@@ -59,6 +61,11 @@ def main() -> None:
     aah = report["avg_articles_on_hit"]
     print(f"  avg_articles/hit: {aah:.1f}  (articles attached to the gold section — lower = less over-attach)"
           if aah is not None else "  avg_articles/hit: n/a")
+
+    if args.min_hit_at_k is not None and report["hit_at_k"] < args.min_hit_at_k:
+        raise SystemExit(
+            f"\nFAIL: hit@k {report['hit_at_k']:.2%} < threshold {args.min_hit_at_k:.2%}"
+        )
 
 
 if __name__ == "__main__":

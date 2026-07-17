@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [master, dev]
+  pull_request:
+  # Retrieval eval is manual + nightly (it costs OpenAI tokens and needs the corpus).
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * *"  # 03:00 UTC daily
+
+jobs:
+  # Fast gate — runs on every push/PR, no secrets, no external services.
+  lint-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - run: ruff check .
+      - run: pytest -q
+
+  # Retrieval-quality gate — fails the build if hit@k regresses below the floor.
+  # Guarded on OPENAI_API_KEY so it silently skips on forks / unconfigured repos.
+  # Needs the prebuilt corpus (data/processed/<book>/chunks.jsonl); that file is
+  # gitignored, so run this on a runner where the corpus is present (self-hosted,
+  # or add a step that downloads it before "Embed").
+  eval:
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    services:
+      qdrant:
+        image: qdrant/qdrant
+        ports:
+          - 6333:6333
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      UPSC_RAG_QDRANT_URL: http://localhost:6333
+      BOOK: laxmikanth_6
+    steps:
+      - uses: actions/checkout@v4
+      - name: Skip if no API key
+        id: guard
+        run: |
+          if [ -z "$OPENAI_API_KEY" ]; then
+            echo "OPENAI_API_KEY not set — skipping eval."; echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/setup-python@v5
+        if: steps.guard.outputs.run == 'true'
+        with:
+          python-version: "3.13"
+          cache: pip
+      - if: steps.guard.outputs.run == 'true'
+        run: pip install -e .
+      - name: Check corpus is present
+        if: steps.guard.outputs.run == 'true'
+        run: |
+          test -f "data/processed/$BOOK/chunks.jsonl" || {
+            echo "Missing data/processed/$BOOK/chunks.jsonl — provide the corpus before this step."; exit 1;
+          }
+      - name: Embed into Qdrant
+        if: steps.guard.outputs.run == 'true'
+        run: python scripts/embed.py --book "$BOOK"
+      - name: Retrieval eval (gate)
+        if: steps.guard.outputs.run == 'true'
+        run: python scripts/evaluate.py --book "$BOOK" --rerank 8 --min-hit-at-k 0.95
