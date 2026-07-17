@@ -4,6 +4,7 @@
                       └(answer)→ domain_gate ─(off_topic)→ END
                                              └(answer)→ agent ⇄ tools ─→ synthesize → END
 
+
 The agent ⇄ tools cycle is the ReAct loop: the agent (LLM with tools bound) decides
 whether to fetch more, the tools node executes and records results, and control returns
 to the agent until it stops requesting tools (or the iteration cap trips) — then the
