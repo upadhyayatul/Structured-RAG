@@ -14,6 +14,11 @@ from __future__ import annotations
 import os
 from typing import Any
 
+# Bound how long a single chat call may hang before it fails, so a wedged upstream
+# (OpenAI or the proxy black-holing) can't pin a worker forever. The SDK already retries
+# transient errors with backoff; this only caps the per-attempt wait. Tunable via env.
+_TIMEOUT_S = float(os.environ.get("UPSC_RAG_LLM_TIMEOUT", "30"))
+
 
 def gateway_enabled() -> bool:
     """True when the LiteLLM proxy gateway is selected via env (default: direct OpenAI)."""
@@ -41,5 +46,5 @@ def get_openai_client() -> Any:
     from openai import OpenAI
 
     if gateway_enabled():
-        return OpenAI(base_url=_gateway_base_url(), api_key=_gateway_api_key())
-    return OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+        return OpenAI(base_url=_gateway_base_url(), api_key=_gateway_api_key(), timeout=_TIMEOUT_S)
+    return OpenAI(api_key=os.environ["OPENAI_API_KEY"], timeout=_TIMEOUT_S)

@@ -95,10 +95,14 @@ class HybridRetriever:
                 model_name=self._rerank_model, max_chars=self._rerank_max_chars
             )
 
-        self._qdrant = QdrantClient(url=indexing_cfg["qdrant_url"])
+        # timeout: fail fast if Qdrant is unreachable instead of hanging the request.
+        self._qdrant = QdrantClient(url=indexing_cfg["qdrant_url"], timeout=5)
         # Embeddings stay on the direct OpenAI endpoint (dimension-locked to Qdrant,
         # deliberately NOT routed through the LiteLLM gateway).
-        self._openai = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+        self._openai = OpenAI(
+            api_key=os.environ["OPENAI_API_KEY"],
+            timeout=float(os.environ.get("UPSC_RAG_LLM_TIMEOUT", "30")),
+        )
         # Query rewrite is a chat call, so it goes through the gateway when enabled.
         self._chat_client = get_openai_client()
 

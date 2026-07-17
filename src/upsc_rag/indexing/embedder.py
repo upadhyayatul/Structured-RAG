@@ -19,7 +19,12 @@ def embed_texts(
 
     Retries each batch up to 3 times with exponential backoff on transient errors.
     """
-    client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+    # Cap the per-call wait so a hung embeddings endpoint fails fast on the retrieval
+    # hot path instead of pinning the request (the retry loop below still handles errors).
+    client = OpenAI(
+        api_key=os.environ.get("OPENAI_API_KEY"),
+        timeout=float(os.environ.get("UPSC_RAG_LLM_TIMEOUT", "30")),
+    )
     vectors: list[list[float]] = []
 
     for i in range(0, len(texts), batch_size):
